@@ -2759,7 +2759,6 @@ void main_imu_restart(void)
 	{
 		LOG_INF("main_imu_restart: skipped because main_ok=0");
 	}
-	}
 }
 
 #if CONFIG_SENSOR_USE_TCAL

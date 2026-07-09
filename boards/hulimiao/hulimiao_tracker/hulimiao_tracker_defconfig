@@ -4,9 +4,10 @@
 CONFIG_ARM_MPU=y
 CONFIG_HW_STACK_PROTECTION=y
 
-CONFIG_USB_DEVICE_STACK=y
-CONFIG_USB_DEVICE_MANUFACTURER="hulimiao"
-CONFIG_USB_DEVICE_PRODUCT="hulimiao_tracker"
+# USB device descriptors (project-specific Kconfig, does not pull in legacy USB stack).
+# Matches upstream nekonya_tracker_uf2 naming convention.
+CONFIG_SLIMEVR_USB_DEVICE_MANUFACTURER="hulimiao"
+CONFIG_SLIMEVR_USB_DEVICE_PRODUCT="hulimiao_tracker"
 
 CONFIG_BATTERY_USE_REG_BUCK_MAPPING=y
 

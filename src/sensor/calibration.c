@@ -79,7 +79,7 @@ static uint16_t sens_cal_revolutions;
 // possible as the buffer fills.
 #define ONLINE_MAG_CAL_MIN_SAMPLES 64    // online (background) calibration
 // Attempt trial calibration every this many new samples (manual cal)
-#define MAG_CAL_TRIAL_INTERVAL (MAG_CAL_MIN_SAMPLES / 2)
+#define MAG_CAL_TRIAL_INTERVAL (CONFIG_SENSOR_MAG_CAL_MIN_SAMPLES / 2)
 
 // Sensor-adaptive calibration parameters (manual calibration only).
 // The runtime variables below are initialised from sensor_mag->cal_noise_mg
