@@ -56,9 +56,11 @@ void sensor_calibration_init_noise_params(void);
 int sensor_request_calibration_sens(uint8_t axis, uint16_t revolutions);
 #endif
 void sensor_calibration_online_mag_sample(const float m[3]);
-int sensor_calibration_online_mag_status(void);
+int sensor_calibration_online_mag_status(float *dir_bias);
 void sensor_calibration_track_mag_norm(float cal_norm);
 float sensor_calibration_get_mag_quality(void);
+void sensor_calibration_set_online_mag_enabled(bool enabled);
+bool sensor_calibration_get_online_mag_enabled(void);
 void sensor_calibration_online_mag_retained_save(void);
 void sensor_calibration_online_mag_retained_clear(void);
 void sensor_calibration_online_mag_cold_start(void);
