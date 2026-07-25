@@ -131,25 +131,29 @@ int qmc5883l_update_odr(float time, float *actual_time)
 	}
 
 	uint8_t STAT = (QMC5883L_OSR_512 << 6) | (QMC5883L_RNG_8G << 4) | (MODR << 2) | MODE;
-	if (last_odr == STAT)
-		return 1;
-	last_odr = STAT;
+	if (last_odr == STAT) {
+		*actual_time = time;
+		return 0; /* already configured — success for err|= callers */
+	}
 
 	int err;
 	if (MODE == QMC5883L_MODE_STANDBY)
 		err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, QMC5883L_MODE_STANDBY);
 	else
 		err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, QMC5883L_CTRL_1, STAT);
-	if (err)
+	if (err) {
 		LOG_ERR("Communication error");
+		return err;
+	}
 
+	last_odr = STAT;
 	oneshot_trigger_time = 0;
 
 	if (MODE != QMC5883L_MODE_STANDBY)
 		mag_period_ms = (int32_t)(time * 1000);
 
 	*actual_time = time;
-	return err;
+	return 0;
 }
 
 void qmc5883l_mag_oneshot(void)
