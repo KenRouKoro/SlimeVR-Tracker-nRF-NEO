@@ -96,17 +96,20 @@ int lis2_update_odr(float time, float *actual_time)
 		time = INFINITY;
 	}
 
-	if (last_odr == MODR)
-		return 1;
-	else
-		last_odr = MODR;
+	if (last_odr == MODR) {
+		*actual_time = time;
+		return 0; /* already configured — success for err|= callers */
+	}
 
 	int err = ssi_reg_write_byte(SENSOR_INTERFACE_DEV_MAG, LIS2MDL_CFG_REG_A, COMP_TEMP_EN | MODR << 2 | MD); // set mag ODR and MD (temp comp must be on)
-	if (err)
+	if (err) {
 		LOG_ERR("Communication error");
+		return err;
+	}
 
+	last_odr = MODR;
 	*actual_time = time;
-	return err;
+	return 0;
 }
 
 void lis2_mag_oneshot(void)
