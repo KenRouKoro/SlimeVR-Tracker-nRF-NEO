@@ -72,6 +72,9 @@
 #if IS_ENABLED(CONFIG_SENSOR_DRV_LIS3MDL)
 #include "mag/LIS3MDL.h"
 #endif
+#if IS_ENABLED(CONFIG_SENSOR_DRV_MMC5603NJ)
+#include "mag/MMC5603NJ.h"
+#endif
 #if IS_ENABLED(CONFIG_SENSOR_DRV_MMC5983MA)
 #include "mag/MMC5983MA.h"
 #endif
