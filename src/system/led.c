@@ -505,6 +505,12 @@ static void led_thread(void)
 			led_pin_set_coverage(mag_cal_coverage);
 			k_msleep(200);
 			break;
+		case SYS_LED_PATTERN_DFU:
+			/* Fast yellow pulse: 100 ms on, 100 ms off. */
+			led_pattern_state = (led_pattern_state + 1) % 2;
+			led_pin_set(SYS_LED_COLOR_CHARGING, 10000, led_pattern_state * 10000);
+			k_msleep(100);
+			break;
 
 		default:
 			LOG_DBG("led_thread: suspending led_thread_id");

@@ -3,6 +3,7 @@
 
 board:
   name: ecan_ecbt_uf2
+  full_name: ECAN ECBT
   vendor: ecan
   socs:
     - name: nrf52840

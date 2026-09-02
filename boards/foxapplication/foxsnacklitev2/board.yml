@@ -3,6 +3,7 @@
 
 board:
   name: foxsnacklitev2_uf2
+  full_name: FoxApplication FoxSnackLiteV2 Tracker
   vendor: foxapplication
   socs:
     - name: nrf52840
