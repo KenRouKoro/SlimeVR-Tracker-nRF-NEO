@@ -43,14 +43,24 @@
 		};
 	};
 
+	/*
+	 * rev3 hardware has no external I2C pull-ups, and nrfx TWIM is
+	 * initialized with skip_gpio_cfg (see i2c_nrfx_twim.c), so this
+	 * internal pull-up is the only one on the bus. Do not remove.
+	 */
 	i2c0_default: i2c0_default {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 15)>,
 					<NRF_PSEL(TWIM_SCL, 0, 13)>;
-			bias-disable;
+			bias-pull-up;
 		};
 	};
 
+	/*
+	 * Sleep keeps both pins unpulled: the sensor rail is switched off
+	 * (vcc-gpios) before suspend, and a pull-up would push current into
+	 * the unpowered sensors through their ESD diodes.
+	 */
 	i2c0_sleep: i2c0_sleep {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 15)>,
@@ -131,6 +141,10 @@
 		led2-gpios = <&gpio1 9 (GPIO_OPEN_SOURCE)>;
 		chg-gpios = <&gpio0 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		stby-gpios = <&gpio1 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		/* External sensor-rail LDO enable (active high). Driven high by board.c
+		 * at boot and kept high in WOM sleep (the IMU must stay powered to
+		 * wake the SoC); System OFF drives it low instead of releasing it —
+		 * see CONFIG_VCC_GPIO_IS_ENABLE in the board defconfig. */
 		vcc-gpios = <&gpio1 2 0>;
 	};
 
@@ -185,6 +199,17 @@ zephyr_udc0: &usbd {
 
 &nfct {
 	status = "disabled";
+};
+
+/*
+ * chg-gpios sits on P0.09, which is an NFCT antenna pin by default
+ * (UICR.NFCPINS reset value is 0xFFFFFFFF = NFC protected). Without this
+ * the charge-status input and its wake sense are dead on a chip whose UICR
+ * was not already patched by the UF2 bootloader. nrfx clears UICR.NFCPINS
+ * and resets once, on the first boot.
+ */
+&uicr {
+	nfct-pins-as-gpios;
 };
 
 &spi3 {
