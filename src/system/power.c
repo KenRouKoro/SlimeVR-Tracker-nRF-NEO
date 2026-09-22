@@ -122,7 +122,9 @@ static const struct gpio_dt_spec vcc = GPIO_DT_SPEC_GET(ZEPHYR_USER_NODE, vcc_gp
 
 #define ADAFRUIT_BOOTLOADER (CONFIG_BUILD_OUTPUT_UF2 && !CONFIG_BOOTLOADER_MCUBOOT)
 
-/* CS/VCC -> Hi-Z (GPIO_DISCONNECTED); pwr enable -> driven inactive. */
+/* CS/VCC -> Hi-Z (GPIO_DISCONNECTED); pwr enable -> driven inactive.
+ * Exception: boards whose VCC pin is a regulator EN (CONFIG_VCC_GPIO_IS_ENABLE)
+ * must be driven inactive too, otherwise the EN floats while the device is off. */
 static void sys_disconnect_interface_pins(void)
 {
 #if DT_NODE_HAS_COMPAT(DT_BUS(DT_NODELABEL(imu_spi)), zephyr_spi_bitbang)
@@ -152,8 +154,14 @@ static void sys_disconnect_interface_pins(void)
 	nrf_gpio_configure_dt_log("Disabled power GPIO", &pwr, GPIO_OUTPUT_INACTIVE);
 #endif
 #if VCC_EXISTS
+#if CONFIG_VCC_GPIO_IS_ENABLE
+	/* External regulator EN: drive it low so the sensor rail is off. Releasing
+	 * it (Hi-Z) leaves the enable floating and the LDO may stay enabled. */
+	nrf_gpio_configure_dt_log("Disabled VCC (regulator EN) GPIO", &vcc, GPIO_OUTPUT_INACTIVE);
+#else
 	/* Hi-Z (same as nrf_gpio_cfg_default); not OUTPUT_INACTIVE — see TODO above. */
 	nrf_gpio_configure_dt_log("Disconnected VCC GPIO", &vcc, GPIO_DISCONNECTED);
+#endif
 #endif
 }
 
@@ -336,6 +344,74 @@ static void wait_for_logging(void)
 		k_msleep(200);
 	}
 #endif
+}
+
+/*
+ * System OFF latches PIN_CNF and the output level of every pin, so any pin that
+ * is not left as input / input-buffer-disconnected / no-pull can source or sink
+ * current for the whole time the device stays off. Read the registers back and
+ * log the offenders, so a shutdown current measurement can be traced to a pin
+ * instead of guessed. Pins in that Hi-Z state (and pins this firmware never
+ * touched) are only counted.
+ */
+#define PIN_CNF_HIZ_MASK (GPIO_PIN_CNF_DIR_Msk | GPIO_PIN_CNF_INPUT_Msk | GPIO_PIN_CNF_PULL_Msk)
+#define PIN_CNF_HIZ_VAL  (GPIO_PIN_CNF_INPUT_Disconnect << GPIO_PIN_CNF_INPUT_Pos)
+
+static void log_power_down_pin_states(void)
+{
+#define LOG_PD_PORT_ENTRY(node_id)                                                            \
+	{                                                                                     \
+		DT_PROP(node_id, port), (NRF_GPIO_Type *)DT_REG_ADDR(node_id),                \
+			DT_PROP(node_id, ngpios)                                              \
+	},
+	static const struct {
+		uint8_t port;
+		NRF_GPIO_Type *regs;
+		uint8_t pins;
+	} gpio_ports[] = {
+		DT_FOREACH_STATUS_OKAY(nordic_nrf_gpio, LOG_PD_PORT_ENTRY)
+	};
+#undef LOG_PD_PORT_ENTRY
+
+	for (size_t p = 0; p < ARRAY_SIZE(gpio_ports); p++) {
+		uint8_t configured = 0;
+
+		for (uint8_t pin = 0; pin < gpio_ports[p].pins; pin++) {
+			uint32_t cnf = gpio_ports[p].regs->PIN_CNF[pin];
+
+			if ((cnf & PIN_CNF_HIZ_MASK) == PIN_CNF_HIZ_VAL) {
+				continue; /* Hi-Z: input, buffer disconnected, no pull */
+			}
+			configured++;
+			if (configured > 16) {
+				continue; /* keep the log bounded on a misconfigured build */
+			}
+			uint32_t pull = (cnf & GPIO_PIN_CNF_PULL_Msk) >> GPIO_PIN_CNF_PULL_Pos;
+			uint32_t sense = (cnf & GPIO_PIN_CNF_SENSE_Msk) >> GPIO_PIN_CNF_SENSE_Pos;
+
+			LOG_INF(
+				"  P%u.%02u: %s, %s, %s%s",
+				gpio_ports[p].port,
+				pin,
+				(cnf & GPIO_PIN_CNF_DIR_Msk)
+					? ((gpio_ports[p].regs->OUT & BIT(pin)) ? "out-high" : "out-low")
+					: "input",
+				(cnf & GPIO_PIN_CNF_INPUT_Msk) ? "buffer-off" : "buffer-on",
+				pull == GPIO_PIN_CNF_PULL_Disabled
+					? "no-pull"
+					: (pull == GPIO_PIN_CNF_PULL_Pulldown ? "pull-down" : "pull-up"),
+				sense == GPIO_PIN_CNF_SENSE_Disabled
+					? ""
+					: (sense == GPIO_PIN_CNF_SENSE_Low ? ", sense-low" : ", sense-high")
+			);
+		}
+		LOG_INF(
+			"P%u: %u pin(s) not Hi-Z, %u Hi-Z",
+			gpio_ports[p].port,
+			configured,
+			gpio_ports[p].pins - configured
+		);
+	}
 }
 
 static void sys_cancel_WOM_locked(void)
@@ -585,6 +661,8 @@ static bool sys_system_off(void) // TODO: add timeout
 #if CONFIG_DISABLE_SENSOR_GPIOS_ON_SHUTDOWN
 	disconnect_sensor_pins();
 #endif
+	/* All pin states for this power-down are final now: report what is not Hi-Z. */
+	log_power_down_pin_states();
 	sys_update_battery_tracker(power_battery_current_pptt(), power_battery_device_plugged());
 	// retained_update();
 	wait_for_logging();

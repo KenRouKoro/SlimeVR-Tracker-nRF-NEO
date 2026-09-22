@@ -111,6 +111,18 @@ config IGNORE_CHARGE_WAKE_ON_VBUS
         sources during system shutdown. This keeps charge state transitions
         from waking the device while USB power is already connected.
 
+config VCC_GPIO_IS_ENABLE
+    bool "vcc-gpios drives a regulator enable pin"
+    default n
+    help
+        Some boards wire vcc-gpios to an external LDO / load switch EN pin
+        instead of switching the sensor rail directly. Before entering System
+        OFF such a pin must be driven inactive (low) rather than released to
+        Hi-Z: a floating enable input leaves the rail state up to the
+        regulator's own pull resistor, and the LDO may stay on and keep the
+        sensors (plus its own quiescent current) powered for the whole
+        shutdown. Boards whose vcc-gpios is an enable pin should select this.
+
 config USE_IMU_WAKE_UP
     bool "IMU wake up support"
     default n
