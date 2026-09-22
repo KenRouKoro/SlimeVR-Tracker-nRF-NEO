@@ -74,17 +74,27 @@ static void magneto_center_get(const mag_center_estimator_t *estimator, float ce
 	}
 }
 
-float magneto_center_min_range(const mag_center_estimator_t *estimator)
+void magneto_center_axis_spans(const mag_center_estimator_t *estimator, float spans[3])
 {
 	if (!estimator->initialized) {
-		return 0.0f;
+		memset(spans, 0, sizeof(float) * 3);
+		return;
 	}
+	for (int i = 0; i < 3; i++) {
+		spans[i] = estimator->max[i] - estimator->min[i];
+	}
+}
 
-	float min_range = estimator->max[0] - estimator->min[0];
+float magneto_center_min_range(const mag_center_estimator_t *estimator)
+{
+	float spans[3];
+
+	magneto_center_axis_spans(estimator, spans);
+
+	float min_range = spans[0];
 	for (int i = 1; i < 3; i++) {
-		float range = estimator->max[i] - estimator->min[i];
-		if (range < min_range) {
-			min_range = range;
+		if (spans[i] < min_range) {
+			min_range = spans[i];
 		}
 	}
 	return min_range;
