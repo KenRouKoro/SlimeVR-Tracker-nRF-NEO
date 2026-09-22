@@ -116,11 +116,20 @@ int sensor_calibrate_mag(void)
 	}
 	sensor_sample_mag_magneto_sample(m); // 400us
 
-	// Periodic status log every 1 second
+	// Periodic status log every 1 second. Note: the counter tracks accepted
+	// *orientations* (direction-gate + chunk averaging), not mag samples;
+	// the coverage values are what must grow for the calibration to proceed.
 	int64_t now = k_uptime_get();
 	if (now - mag_cal_last_status_log >= 1000) {
 		mag_cal_last_status_log = now;
-		LOG_INF("Mag cal: %d samples collected", (int)sample_count);
+		LOG_INF(
+			"Mag cal: %d samples collected (coverage dir=%.2f/%.2f raw=%.3f/%.3f G)",
+			(int)sample_count,
+			(double)magneto_min_dir_range(),
+			(double)MAG_CAL_MIN_DIR_RANGE,
+			(double)magneto_center_min_range(&manual_center_estimator),
+			(double)MAG_CAL_MIN_RAW_AXIS_RANGE
+		);
 	}
 
 	if (magneto_progress != 0b11111111) {
@@ -555,6 +564,22 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 			(double)min_range,
 			(double)MAG_CAL_MIN_DIR_RANGE,
 			(double)raw_range,
+			(double)MAG_CAL_MIN_RAW_AXIS_RANGE
+		);
+		// Which axis is short is what the operator has to act on: both gates
+		// take the minimum across axes, so one under-covered axis stalls the
+		// whole calibration no matter how long the tracker is turned.
+		float raw_spans[3];
+		magneto_center_axis_spans(&manual_center_estimator, raw_spans);
+		LOG_INF(
+			"Mag cal axes: dir spans [%.2f %.2f %.2f] (need %.2f each), raw spans [%.3f %.3f %.3f] G (need %.3f each)",
+			(double)(dir_max[0] - dir_min[0]),
+			(double)(dir_max[1] - dir_min[1]),
+			(double)(dir_max[2] - dir_min[2]),
+			(double)MAG_CAL_MIN_DIR_RANGE,
+			(double)raw_spans[0],
+			(double)raw_spans[1],
+			(double)raw_spans[2],
 			(double)MAG_CAL_MIN_RAW_AXIS_RANGE
 		);
 

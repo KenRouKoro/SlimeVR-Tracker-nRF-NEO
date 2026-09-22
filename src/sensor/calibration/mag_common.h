@@ -64,6 +64,7 @@ extern uint8_t magneto_progress;
 void magneto_center_reset(mag_center_estimator_t *estimator);
 bool magneto_center_prefilter_pass(const mag_center_estimator_t *estimator, const float m[3]);
 void magneto_center_update(mag_center_estimator_t *estimator, const float m[3]);
+void magneto_center_axis_spans(const mag_center_estimator_t *estimator, float spans[3]);
 float magneto_center_min_range(const mag_center_estimator_t *estimator);
 void magneto_coverage_sample(const mag_center_estimator_t *estimator, const float m[3],
 			     float coverage_sample[3]);
