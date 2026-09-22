@@ -10,5 +10,10 @@ CONFIG_SLIMEVR_USB_DEVICE_PRODUCT="FoxSnackLiteV2 LSM6DSV Tracker"
 CONFIG_BATTERY_USE_REG_BUCK_MAPPING=y
 CONFIG_IGNORE_CHARGE_WAKE_ON_VBUS=y
 
+# vcc-gpios (P1.00) is the enable pin of the external sensor-rail LDO, not a
+# switched rail: System OFF must drive it low instead of releasing it (Hi-Z),
+# otherwise the EN floats and the rail can stay powered.
+CONFIG_VCC_GPIO_IS_ENABLE=y
+
 #generate for adafruit uf2 bootloader flashing
 CONFIG_BUILD_OUTPUT_UF2=y
