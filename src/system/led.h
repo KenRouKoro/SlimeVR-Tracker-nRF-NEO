@@ -73,4 +73,8 @@ void set_led(enum sys_led_pattern led_pattern, int priority);
 
 extern float mag_cal_coverage;
 
+/* Blocking black/power-gate barrier for shutdown threads only (not ISR or
+ * LED-worker context). Concurrent callers are serialized. */
+void led_shutdown(void);
+
 #endif

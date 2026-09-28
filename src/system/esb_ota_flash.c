@@ -269,17 +269,31 @@ static void ota_flash_copy_from_ram(const struct flash_copy_params *p)
 		NRF_NVMC->ERASEPAGE = p->settings_addr;
 		while (!NRF_NVMC->READY) {}
 
-		/* Write settings */
+		/* Write metadata first while bank_0 remains invalid. The final word
+		 * commits BANK_VALID_APP only after all other settings are present. */
 		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Wen;
 		__DSB();
 		volatile uint32_t *dst = (volatile uint32_t *)p->settings_addr;
-		for (uint32_t w = 0; w < p->settings_words; w++) {
+		for (uint32_t w = 1; w < p->settings_words; w++) {
 			dst[w] = p->settings_data[w];
-			while (!NRF_NVMC->READY) {}
+			while (!NRF_NVMC->READY) {
+			}
+		}
+		dst[0] = p->settings_data[0];
+		while (!NRF_NVMC->READY) {
 		}
 
 		NRF_NVMC->CONFIG = NVMC_CONFIG_WEN_Ren;
 		__DSB();
+		for (uint32_t w = 0; w < p->settings_words; w++) {
+			if (dst[w] != p->settings_data[w]) {
+				((volatile uint32_t *)0x4000051C)[0] = 0x57;
+				SCB->AIRCR = (0x5FA << SCB_AIRCR_VECTKEY_Pos) | SCB_AIRCR_SYSRESETREQ_Msk;
+				__DSB();
+				for (;;) {
+				}
+			}
+		}
 	}
 
 	/* Reset */
@@ -345,7 +359,8 @@ void esb_ota_flash_copy_and_reset(uint32_t staging_base, uint32_t target_base,
 #endif
 }
 
-uint32_t esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scratch)
+int esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scratch,
+			      uint32_t *result)
 {
 	uint32_t crc = 0;
 	uint32_t remaining = size;
@@ -356,15 +371,15 @@ uint32_t esb_ota_flash_compute_crc32(uint32_t addr, uint32_t size, uint8_t *scra
 		int err = flash_read(flash_dev, offset, scratch, chunk);
 		if (err) {
 			LOG_ERR("OTA: Flash read failed at 0x%05X (err %d)", offset, err);
-			/* Nonzero poison so callers cannot treat failure as a valid CRC. */
-			return 0xFFFFFFFFu;
+			return err;
 		}
 		crc = crc32_ieee_update(crc, scratch, chunk);
 		offset += chunk;
 		remaining -= chunk;
 	}
 
-	return crc;
+	*result = crc;
+	return 0;
 }
 
 /**

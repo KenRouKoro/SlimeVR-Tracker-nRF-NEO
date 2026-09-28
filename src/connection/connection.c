@@ -28,6 +28,8 @@
 #include "util.h"
 #include "esb.h"
 #include "sensor_data_snapshot.h"
+#include "tracker_events.h"
+#include "raw_retx.h"
 #include "tdma.h"
 #include "build_defines.h"
 #include "hid.h"
@@ -236,6 +238,15 @@ uint8_t connection_get_packet_sequence(void)
 	return packet_sequence;
 }
 
+enum sub_packet_type {
+	SUB_PACKET_INFO = 0,
+	SUB_PACKET_QUAT_ACCEL = 1,
+	SUB_PACKET_COMPACT_QUAT = 2,
+	SUB_PACKET_STATUS = 3,
+	SUB_PACKET_QUAT_MAG = 4,
+	SUB_PACKET_RUNTIME = 5,
+};
+
 /*
  * Sub-packet data sizes (payload only, excluding type byte).
  * These define how much data each sub-packet type contributes
@@ -340,6 +351,8 @@ struct composite_builder {
 	int64_t stamps[5];
 	int n;
 	int used;
+	bool has_event;
+	struct tracker_event_tx event;
 };
 
 typedef int (*sub_fill_fn)(uint8_t *buf);
@@ -352,12 +365,12 @@ struct sub_packet_desc {
 
 /* Indexed by sub-packet type. One source for len + fill used by normal + composite. */
 static const struct sub_packet_desc sub_packet_table[] = {
-	[0] = {SUB_DATA_LEN_INFO, true, fill_sub_info},
-	[1] = {SUB_DATA_LEN_QUAT, false, fill_sub_quat_accel},
-	[2] = {SUB_DATA_LEN_COMPACT, true, fill_sub_compact_quat},
-	[3] = {SUB_DATA_LEN_STATUS, true, fill_sub_status},
-	[4] = {SUB_DATA_LEN_MAG, false, fill_sub_mag},
-	[5] = {SUB_DATA_LEN_RUNTIME, true, fill_sub_runtime},
+	[SUB_PACKET_INFO] = {SUB_DATA_LEN_INFO, true, fill_sub_info},
+	[SUB_PACKET_QUAT_ACCEL] = {SUB_DATA_LEN_QUAT, false, fill_sub_quat_accel},
+	[SUB_PACKET_COMPACT_QUAT] = {SUB_DATA_LEN_COMPACT, true, fill_sub_compact_quat},
+	[SUB_PACKET_STATUS] = {SUB_DATA_LEN_STATUS, true, fill_sub_status},
+	[SUB_PACKET_QUAT_MAG] = {SUB_DATA_LEN_MAG, false, fill_sub_mag},
+	[SUB_PACKET_RUNTIME] = {SUB_DATA_LEN_RUNTIME, true, fill_sub_runtime},
 };
 
 static const struct sub_packet_desc *sub_packet_get(uint8_t type)
@@ -388,8 +401,8 @@ static void fill_normal_packet(uint8_t type, uint8_t data[16])
 	memset(data, 0, 16);
 	const struct sub_packet_desc *d = sub_packet_get(type);
 	if (!d) {
-		type = 1;
-		d = sub_packet_get(1);
+		type = SUB_PACKET_QUAT_ACCEL;
+		d = sub_packet_get(SUB_PACKET_QUAT_ACCEL);
 	}
 	data[0] = type;
 	data[1] = tracker_id;
@@ -571,55 +584,6 @@ void connection_update_status(int status)
 //| |4      |id      |q0               |q1               |q2               |q3               |m0 |m1 |m2 |
 //| |5      |id      |runtime (uint64, us)                              |resv              |rssi |
 
-bool connection_write_packet_0() // device info
-{
-	uint8_t data[16];
-
-	fill_normal_packet(0, data);
-	return write_normal_packet(data);
-}
-
-bool connection_write_packet_1() // full precision quat and accel
-{
-	uint8_t data[16];
-
-	fill_normal_packet(1, data);
-	return write_normal_packet(data);
-}
-
-bool connection_write_packet_2() // reduced precision quat and accel with battery,
-				 // temp, and rssi
-{
-	uint8_t data[16];
-
-	fill_normal_packet(2, data);
-	return write_normal_packet(data);
-}
-
-bool connection_write_packet_3() // status
-{
-	uint8_t data[16];
-
-	fill_normal_packet(3, data);
-	return write_normal_packet(data);
-}
-
-bool connection_write_packet_4() // full precision quat and magnetometer
-{
-	uint8_t data[16];
-
-	fill_normal_packet(4, data);
-	return write_normal_packet(data);
-}
-
-bool connection_write_packet_5() // runtime estimate
-{
-	uint8_t data[16];
-
-	fill_normal_packet(5, data);
-	return write_normal_packet(data);
-}
-
 static int64_t last_info_time = 0;
 static int64_t last_status_time = 0;
 static int64_t last_runtime_time = 0;
@@ -661,46 +625,123 @@ struct raw_imu_queued {
 	float gyr_quat[4];
 	float accel[3];
 	float temp_c;
+	uint32_t session;
 };
 
 K_MSGQ_DEFINE(raw_imu_msgq, sizeof(struct raw_imu_queued), RAW_IMU_QUEUE_SIZE, 4);
 
 static uint16_t raw_sequence = 0;
 static atomic_t data_collection_active;
+static atomic_t data_collection_batch_active;
+static uint16_t data_collection_batch_rate_hz;
+static int64_t dc_conn_error_start;
+/* While batch collection runs, fusion data only needs to keep the server
+ * side minimally alive; 10 TPS leaves the radio almost fully to raw+TDMA.
+ * 0 restores the built-in 100 TPS default on every batch exit path. */
+#define DC_BATCH_FUSION_TPS 10U
 static volatile bool ota_suppressed = false; /* Reduce poll rate during parallel OTA */
 static int64_t ota_suppress_start_time = 0;  /* Timestamp when suppress was enabled */
 #define OTA_SUPPRESS_TIMEOUT_MS (10 * 60 * 1000)
 
 /*
- * ARQ ring buffer: stores last RAW_RING_SIZE sent packets for retransmission.
- * Indexed by (sequence % RAW_RING_SIZE).
+ * ARQ ring buffer: stores the last RAW_RING_SIZE sent packets for
+ * retransmission. The packet's existing big-endian sequence at bytes 2..3 is
+ * authoritative; the bitmap only records whether a slot contains a published
+ * packet for the current collection session.
  */
-#define RAW_RING_SIZE 256
+#define RAW_RING_SIZE 128
 #define RAW_PACKET_SIZE 52 /* Fixed size for raw meta / gyrQuat / cal payloads */
 static uint8_t raw_ring[RAW_RING_SIZE][RAW_PACKET_SIZE];
-static bool raw_ring_valid[RAW_RING_SIZE];
-static uint16_t raw_ring_seq[RAW_RING_SIZE];
+static uint8_t raw_ring_valid_bits[(RAW_RING_SIZE + 7) / 8];
+static uint8_t *raw_ring_get(uint16_t sequence)
+{
+	uint16_t index = sequence % RAW_RING_SIZE;
+	uint8_t mask = (uint8_t)BIT(index & 7U);
+	if ((raw_ring_valid_bits[index >> 3] & mask) == 0
+		|| sys_get_be16(&raw_ring[index][2]) != sequence) {
+		return NULL;
+	}
+	return raw_ring[index];
+}
+
+static void raw_ring_store(const uint8_t packet[RAW_PACKET_SIZE])
+{
+	uint16_t sequence = sys_get_be16(&packet[2]);
+	uint16_t index = sequence % RAW_RING_SIZE;
+	uint8_t mask = (uint8_t)BIT(index & 7U);
+	uint8_t *valid_byte = &raw_ring_valid_bits[index >> 3];
+
+	/* Invalidate before overwrite, then publish only after the complete
+	 * packet (including its BE sequence) is in the slot. */
+	*valid_byte &= (uint8_t)~mask;
+	memcpy(raw_ring[index], packet, RAW_PACKET_SIZE);
+	*valid_byte |= mask;
+}
 
 /*
  * Retransmit queue: filled by ESB event handler when ACK payload carries
- * retransmit requests (RAW_ARQ_MARKER).  Up to RAW_RETX_MAX entries.
+ * retransmit requests (RAW_ARQ_MARKER). Up to RAW_RETX_MAX entries.
  * Connection thread drains this before sending new data.
  */
-#define RAW_RETX_MAX 16
-volatile uint16_t raw_retx_queue[RAW_RETX_MAX];
-volatile uint8_t raw_retx_count;
+static struct raw_retx_requests raw_retx;
 static volatile uint32_t raw_retx_total; /* lifetime retransmit count */
-static bool raw_metadata_sent = false;
-static int64_t raw_metadata_last_ms = 0;
-#define RAW_METADATA_RESEND_MS 60000
 
-/* Deferred metadata: sensor thread buffers here, connection thread sends */
+int connection_request_raw_retransmit(uint16_t sequence)
+{
+	unsigned key = irq_lock();
+	int err = -EACCES;
+	if (connection_get_data_collection() && !connection_get_data_collection_batch()) {
+		err = raw_retx_submit(&raw_retx, sequence);
+	}
+	irq_unlock(key);
+	return err;
+}
+static bool raw_metadata_sent = false;
+
+/* Metadata and calibration are captured once at collection-session start.
+ * Subsequent requests select bytes from this immutable snapshot, so a live
+ * calibration update cannot mix generations within one recording. */
 static bool raw_metadata_pending = false;
 static uint8_t raw_metadata_buf[RAW_PACKET_SIZE];
+static atomic_t raw_snapshot_ready;
+static int64_t raw_meta_cal_last_ms;
+static uint8_t raw_cal_pending_mask;
+static uint8_t raw_cal_pending_chunk;
+static bool raw_cal_pending;
+static struct k_spinlock raw_request_lock;
+static uint8_t raw_request_mask;
+static uint8_t raw_request_chunk;
+static uint16_t raw_request_token;
+static bool raw_cal_points_all;
+static bool raw_request_token_valid;
 
-/* Rate limit for meta/cal drip: max 1 packet per interval, interleaved with IMU data */
-#define RAW_META_CAL_DRIP_MS 200
-static int64_t raw_meta_cal_last_ms = 0;
+
+#define RAW_META_MASK_BASIC      0x01
+#define RAW_META_MASK_ACCEL      0x02
+#define RAW_META_MASK_MAG        0x04
+#define RAW_META_MASK_GYRO       0x08
+#define RAW_META_MASK_TCAL_STATE 0x10
+#define RAW_META_MASK_TCAL_POINTS 0x20
+#define RAW_META_MASK_ALL        0x3f
+static int64_t raw_collection_start_ms;
+static bool connection_raw_collection_active(void);
+static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3]);
+
+struct raw_cal_snapshot {
+	float acc_BAinv[4][3];
+	float mag_BAinv[4][3];
+	float gyro_bias[3];
+	float gyro_scale[3];
+	uint8_t tcal_flags;
+	uint16_t tcal_count;
+	float tcal_temp_min;
+	float tcal_temp_max;
+	uint8_t tcal_apply_mode;
+#if CONFIG_SENSOR_USE_TCAL
+	struct TempCalPoint tcal_points[TCAL_BUFFER_SIZE];
+#endif
+};
+static struct raw_cal_snapshot raw_cal_snapshot;
 
 static struct k_spinlock latest_mag_lock;
 static float latest_mag[3];
@@ -708,31 +749,88 @@ static uint32_t latest_mag_session;
 static bool latest_mag_valid;
 static atomic_t raw_collection_session;
 
-/* Calibration drip-feed state (one packet per connection cycle) */
-static bool raw_cal_pending = false;
-static uint8_t raw_cal_phase = 0;      /* 0=accel, 1=mag, 2=gyro, 3=tcal_state, 4=tcal_points */
-static uint16_t raw_cal_point_idx = 0; /* current TCal slot index */
-static uint8_t raw_cal_chunk_idx = 0;  /* emitted TCal chunk index */
 
+static void connection_schedule_calibration(uint8_t mask, uint8_t chunk)
+{
+	if ((mask & RAW_META_MASK_ALL) == 0 || (mask & ~RAW_META_MASK_ALL) != 0) {
+		return;
+	}
+	if (mask & RAW_META_MASK_BASIC) {
+		raw_metadata_pending = true;
+	}
+	raw_cal_pending_mask |= mask & (uint8_t)~RAW_META_MASK_BASIC;
+	if (mask & RAW_META_MASK_TCAL_POINTS) {
+		raw_cal_points_all = chunk == 255;
+		raw_cal_pending_chunk = raw_cal_points_all ? 0 : chunk;
+	}
+	raw_cal_pending = raw_cal_pending_mask != 0;
+}
 #if CONFIG_SENSOR_USE_TCAL
 static bool connection_tcal_point_valid(const struct TempCalPoint *point)
 {
 	return point->temp != 0.0f;
 }
+#endif
 
-static uint16_t connection_tcal_valid_point_count(void)
+static void connection_capture_calibration_snapshot(bool include_tcal)
 {
-	uint16_t count = 0;
-
-	for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
-		if (connection_tcal_point_valid(&retained->tempCalPoints[i])) {
-			count++;
+	sensor_imu_calibration_t calibration;
+	sensor_calibration_snapshot(&calibration);
+	memcpy(raw_cal_snapshot.acc_BAinv, calibration.accel_matrix, sizeof(raw_cal_snapshot.acc_BAinv));
+	memcpy(raw_cal_snapshot.gyro_bias, calibration.gyro_bias, sizeof(raw_cal_snapshot.gyro_bias));
+	memcpy(raw_cal_snapshot.gyro_scale, retained->gyroSensScale, sizeof(raw_cal_snapshot.gyro_scale));
+	float mag_BAinv[4][3];
+	float mag_body_BAinv[4][3];
+	magneto_online_snapshot_BAinv(mag_BAinv);
+	connection_align_mag_BAinv_body(mag_body_BAinv, mag_BAinv);
+	memcpy(raw_cal_snapshot.mag_BAinv, mag_body_BAinv, sizeof(raw_cal_snapshot.mag_BAinv));
+	raw_cal_snapshot.tcal_flags = 0;
+	raw_cal_snapshot.tcal_count = 0;
+	raw_cal_snapshot.tcal_temp_min = 0.0f;
+	raw_cal_snapshot.tcal_temp_max = 0.0f;
+	raw_cal_snapshot.tcal_apply_mode = 0;
+#if CONFIG_SENSOR_USE_TCAL
+	if (include_tcal) {
+		if (retained->tcal_enabled) raw_cal_snapshot.tcal_flags |= 0x01;
+		switch (sensor_tcal_get_apply_mode()) {
+		case SENSOR_TCAL_APPLY_CURVE: raw_cal_snapshot.tcal_flags |= 0x02; break;
+		case SENSOR_TCAL_APPLY_ZRO_FALLBACK: raw_cal_snapshot.tcal_flags |= 0x04; break;
+		default: break;
+		}
+		raw_cal_snapshot.tcal_apply_mode = (uint8_t)sensor_tcal_get_apply_mode();
+	raw_cal_snapshot.tcal_temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
+	raw_cal_snapshot.tcal_temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
+		for (int i = 0; i < TCAL_BUFFER_SIZE; i++) {
+			if (connection_tcal_point_valid(&retained->tempCalPoints[i])) {
+				raw_cal_snapshot.tcal_points[raw_cal_snapshot.tcal_count++] = retained->tempCalPoints[i];
+			}
 		}
 	}
-
-	return count;
-}
+#else
+	(void)include_tcal;
 #endif
+}
+
+void connection_request_raw_metadata(uint8_t mask, uint8_t chunk, uint16_t token)
+{
+	if (!connection_raw_collection_active() || mask == 0 || (mask & ~RAW_META_MASK_ALL) != 0) {
+		return;
+	}
+	k_spinlock_key_t key = k_spin_lock(&raw_request_lock);
+	if (!raw_request_token_valid || raw_request_token != token) {
+		raw_request_token = token;
+		raw_request_token_valid = true;
+		if ((raw_request_mask & mask & RAW_META_MASK_TCAL_POINTS) != 0
+		    && raw_request_chunk != chunk) {
+			raw_request_chunk = 255;
+		} else if (mask & RAW_META_MASK_TCAL_POINTS) {
+			raw_request_chunk = chunk;
+		}
+		raw_request_mask |= mask;
+	}
+	k_spin_unlock(&raw_request_lock, key);
+	connection_signal_wake();
+}
 
 static void connection_align_mag_body(const float in[3], float out[3])
 {
@@ -776,38 +874,56 @@ static void connection_align_mag_BAinv_body(float out[4][3], const float in[4][3
 	}
 }
 
-void connection_set_data_collection(bool enable)
+static bool connection_raw_collection_active(void)
 {
-	bool was_active = atomic_get(&data_collection_active) != 0;
-	if (!enable) {
-		atomic_set(&data_collection_active, 0);
-	}
-	if (enable && !was_active) {
-		/* Flush any stale data in queues */
-		k_msgq_purge(&raw_imu_msgq);
-		raw_sequence = 0;
-		raw_metadata_sent = false;
-		raw_metadata_pending = false;
-		raw_meta_cal_last_ms = 0;
-		atomic_inc(&raw_collection_session);
-		k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
-		latest_mag_valid = false;
-		k_spin_unlock(&latest_mag_lock, mag_key);
-		raw_cal_pending = false;
-		/* Reset ARQ state */
-		memset(raw_ring_valid, 0, sizeof(raw_ring_valid));
+	return connection_get_data_collection() || connection_get_data_collection_batch();
+}
+
+static void connection_reset_raw_collection(bool reset_arq)
+{
+	k_msgq_purge(&raw_imu_msgq);
+	raw_sequence = 0;
+	raw_metadata_sent = false;
+	raw_metadata_pending = false;
+	raw_meta_cal_last_ms = 0;
+	raw_cal_pending_mask = 0;
+	raw_cal_pending = false;
+	k_spinlock_key_t request_key = k_spin_lock(&raw_request_lock);
+	atomic_clear(&raw_snapshot_ready);
+	raw_request_mask = 0;
+	raw_request_chunk = 0;
+	raw_request_token_valid = false;
+	k_spin_unlock(&raw_request_lock, request_key);
+	raw_collection_start_ms = k_uptime_get();
+	atomic_inc(&raw_collection_session);
+	k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
+	latest_mag_valid = false;
+	k_spin_unlock(&latest_mag_lock, mag_key);
+	if (reset_arq) {
+		memset(raw_ring_valid_bits, 0, sizeof(raw_ring_valid_bits));
 		unsigned key = irq_lock();
-		raw_retx_count = 0;
+		raw_retx_reset(&raw_retx);
 		irq_unlock(key);
 		raw_retx_total = 0;
-	} else if (!enable && was_active) {
+	}
+}
+void connection_set_data_collection(bool enable)
+{
+	bool was_active = connection_get_data_collection();
+	if (enable && connection_get_data_collection_batch()) {
+		atomic_set(&data_collection_batch_active, 0);
+		data_collection_batch_rate_hz = 0;
+		sensor_set_batch_collect(false, 0.0f);
+		test_mode_set_target_tps(0);
+	}
+	if (!enable) atomic_set(&data_collection_active, 0);
+	if (enable && !was_active) connection_reset_raw_collection(true);
+	if (!enable && was_active) {
 		k_spinlock_key_t mag_key = k_spin_lock(&latest_mag_lock);
 		latest_mag_valid = false;
 		k_spin_unlock(&latest_mag_lock, mag_key);
 	}
-	if (enable) {
-		atomic_set(&data_collection_active, 1);
-	}
+	if (enable) atomic_set(&data_collection_active, 1);
 	LOG_INF("Data collection %s", enable ? "STARTED" : "STOPPED");
 }
 
@@ -815,6 +931,53 @@ bool connection_get_data_collection(void)
 {
 	return atomic_get(&data_collection_active) != 0;
 }
+
+int connection_set_data_collection_batch(bool enable, uint16_t rate_hz)
+{
+	bool was_active = connection_get_data_collection_batch();
+	if (enable && was_active) {
+		if (data_collection_batch_rate_hz != rate_hz) {
+			LOG_WRN("Stop batch collection before changing its rate");
+			return -EBUSY;
+		}
+		/* Same-rate retries must not change the session or sensor accumulator. */
+		return 0;
+	}
+	if (enable && connection_get_data_collection()) {
+		connection_set_data_collection(false);
+	}
+	if (!enable) {
+		atomic_set(&data_collection_batch_active, 0);
+		data_collection_batch_rate_hz = 0;
+		sensor_set_batch_collect(false, 0.0f);
+		test_mode_set_target_tps(0);
+	} else {
+		data_collection_batch_rate_hz = rate_hz;
+		if (!was_active) {
+			connection_reset_raw_collection(false);
+		}
+		atomic_set(&data_collection_batch_active, 1);
+		sensor_set_batch_collect(true, (float)rate_hz);
+		test_mode_set_target_tps(DC_BATCH_FUSION_TPS);
+		if (rate_hz == 0) LOG_INF("Batch data collection STARTED at accelerometer ODR");
+		else LOG_INF("Batch data collection STARTED at %u Hz", rate_hz);
+	}
+	if (!enable) {
+		LOG_INF("Batch data collection STOPPED");
+	}
+	return 0;
+}
+
+bool connection_get_data_collection_batch(void)
+{
+	return atomic_get(&data_collection_batch_active) != 0;
+}
+
+uint16_t connection_get_data_collection_batch_rate(void)
+{
+	return data_collection_batch_rate_hz;
+}
+
 
 void connection_set_ota_suppressed(bool suppressed)
 {
@@ -832,17 +995,24 @@ bool connection_get_ota_suppressed(void)
 	return ota_suppressed;
 }
 
+
+bool connection_raw_collection_startup_done(void)
+{
+	return connection_raw_collection_active() && (k_uptime_get() - raw_collection_start_ms >= 5000);
+}
+
 void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 {
-	if (!connection_get_data_collection()) {
-		return;
-	}
-
+	uint32_t session = (uint32_t)atomic_get(&raw_collection_session);
+	/* The raw gyro integrator intentionally continues through warmup; only
+	 * producer admission is gated, so the first transmitted sample is seq 0
+	 * after five seconds without a backlog burst. */
+	if (!connection_raw_collection_active() || !connection_raw_collection_startup_done()) return;
 	struct raw_imu_queued entry;
 	memcpy(entry.gyr_quat, sample->gyr_quat, sizeof(entry.gyr_quat));
 	memcpy(entry.accel, sample->accel, sizeof(entry.accel));
 	entry.temp_c = sample->temp_c;
-
+	entry.session = session;
 	if (k_msgq_put(&raw_imu_msgq, &entry, K_NO_WAIT) != 0) {
 		struct raw_imu_queued discard;
 		k_msgq_get(&raw_imu_msgq, &discard, K_NO_WAIT);
@@ -853,7 +1023,7 @@ void connection_queue_raw_sample(const struct raw_imu_sample *sample)
 
 void connection_queue_raw_mag(const float mag[3])
 {
-	if (!connection_get_data_collection()) {
+	if (!connection_raw_collection_active()) {
 		return;
 	}
 	uint32_t session = (uint32_t)atomic_get(&raw_collection_session);
@@ -861,7 +1031,7 @@ void connection_queue_raw_mag(const float mag[3])
 	float aligned[3];
 	connection_align_mag_body(mag, aligned);
 	k_spinlock_key_t key = k_spin_lock(&latest_mag_lock);
-	if (connection_get_data_collection()
+	if (connection_raw_collection_active()
 	    && session == (uint32_t)atomic_get(&raw_collection_session)) {
 		memcpy(latest_mag, aligned, sizeof(latest_mag));
 		latest_mag_session = session;
@@ -871,257 +1041,187 @@ void connection_queue_raw_mag(const float mag[3])
 }
 
 void connection_send_raw_metadata(
-	float gyro_range,
-	float accel_range,
-	float gyro_odr,
-	float accel_odr,
-	float mag_odr,
-	uint8_t imu,
-	uint8_t mag,
-	float chip_gyro_hz,
-	float fusion_gyro_hz
-)
+	float gyro_range, float accel_range, float gyro_odr, float accel_odr,
+	float mag_odr, uint8_t imu, uint8_t mag, float chip_gyro_hz, float fusion_gyro_hz)
 {
-	/* Buffer metadata for deferred sending by connection thread.
-	 * Never call esb_write() from sensor thread — avoids
-	 * cross-thread ESB TX FIFO contention with raw data flow.
-	 * TX uses full RAW_PACKET_SIZE so chip/fusion Hz trailer stays on the wire. */
+	/* The sensor thread publishes one immutable snapshot per session. */
+	k_spinlock_key_t key = k_spin_lock(&raw_request_lock);
+	if (!connection_raw_collection_active() || atomic_get(&raw_snapshot_ready)) {
+		k_spin_unlock(&raw_request_lock, key);
+		return;
+	}
 	memset(raw_metadata_buf, 0, sizeof(raw_metadata_buf));
 	raw_metadata_buf[0] = ESB_RAW_META_TYPE;
 	raw_metadata_buf[1] = tracker_id;
 	memcpy(&raw_metadata_buf[2], &gyro_range, 4);
 	memcpy(&raw_metadata_buf[6], &accel_range, 4);
-	memcpy(&raw_metadata_buf[10], &gyro_odr, 4); /* raw TX Hz (= fusion rate) */
+	memcpy(&raw_metadata_buf[10], &gyro_odr, 4);
 	memcpy(&raw_metadata_buf[14], &accel_odr, 4);
 	memcpy(&raw_metadata_buf[18], &mag_odr, 4);
 	raw_metadata_buf[22] = imu;
 	raw_metadata_buf[23] = mag;
 	memcpy(&raw_metadata_buf[24], &chip_gyro_hz, 4);
 	memcpy(&raw_metadata_buf[28], &fusion_gyro_hz, 4);
-
-	raw_metadata_pending = true;
-	/* Reset 60s resend timer now so sensor loop won't re-trigger
-	 * connection_raw_metadata_resend_due() before connection thread
-	 * actually sends the buffered metadata. */
-	raw_metadata_last_ms = k_uptime_get();
+	connection_capture_calibration_snapshot(true);
+	raw_request_mask = RAW_META_MASK_ALL;
+	raw_request_chunk = 255;
+	atomic_set(&raw_snapshot_ready, 1);
+	k_spin_unlock(&raw_request_lock, key);
+	connection_signal_wake();
 }
 
-void connection_send_raw_calibration(void)
+static bool connection_send_calibration_mask(uint8_t mask, uint8_t chunk)
 {
-	/* Mark calibration for drip-feed sending.
-	 * Actual packets are sent one-per-cycle in connection_process_raw_data().
-	 */
-	raw_cal_phase = 0;
-	raw_cal_point_idx = 0;
-	raw_cal_chunk_idx = 0;
-	raw_cal_pending = true;
+	uint8_t buf[RAW_PACKET_SIZE] = {0};
+	buf[0] = ESB_RAW_CAL_TYPE;
+	buf[1] = tracker_id;
+	uint8_t subtype_mask = mask & RAW_META_MASK_ALL;
+	if (subtype_mask & RAW_META_MASK_ACCEL) {
+		buf[2] = RAW_CAL_SUB_ACCEL;
+		memcpy(&buf[3], raw_cal_snapshot.acc_BAinv, sizeof(raw_cal_snapshot.acc_BAinv));
+		subtype_mask = RAW_META_MASK_ACCEL;
+	} else if (subtype_mask & RAW_META_MASK_MAG) {
+		buf[2] = RAW_CAL_SUB_MAG;
+		memcpy(&buf[3], raw_cal_snapshot.mag_BAinv, sizeof(raw_cal_snapshot.mag_BAinv));
+		subtype_mask = RAW_META_MASK_MAG;
+	} else if (subtype_mask & RAW_META_MASK_GYRO) {
+		buf[2] = RAW_CAL_SUB_GYRO;
+		memcpy(&buf[3], raw_cal_snapshot.gyro_bias, sizeof(raw_cal_snapshot.gyro_bias));
+		memcpy(&buf[15], raw_cal_snapshot.gyro_scale, sizeof(raw_cal_snapshot.gyro_scale));
+		subtype_mask = RAW_META_MASK_GYRO;
+	} else if (subtype_mask & RAW_META_MASK_TCAL_STATE) {
+		buf[2] = RAW_CAL_SUB_TCAL;
+		buf[3] = raw_cal_snapshot.tcal_flags;
+		memcpy(&buf[4], &raw_cal_snapshot.tcal_count, 2);
+		memcpy(&buf[6], &raw_cal_snapshot.tcal_temp_min, 4);
+		memcpy(&buf[10], &raw_cal_snapshot.tcal_temp_max, 4);
+		buf[14] = raw_cal_snapshot.tcal_apply_mode;
+		subtype_mask = RAW_META_MASK_TCAL_STATE;
+	} else if (subtype_mask & RAW_META_MASK_TCAL_POINTS) {
+#if CONFIG_SENSOR_USE_TCAL
+		uint16_t count = raw_cal_snapshot.tcal_count;
+		uint16_t start = chunk == 255 ? 0 : (uint16_t)chunk * 2U;
+		if (count == 0 || start >= count) return true;
+		uint8_t n = (uint8_t)((count - start) > 2 ? 2 : count - start);
+		buf[2] = RAW_CAL_SUB_TCAL_POINTS;
+		buf[3] = chunk == 255 ? 0 : chunk;
+		memcpy(&buf[4], &count, 2);
+		buf[6] = n;
+		memcpy(&buf[7], &raw_cal_snapshot.tcal_points[start], (size_t)n * sizeof(struct TempCalPoint));
+#else
+		buf[2] = RAW_CAL_SUB_TCAL_POINTS;
+		buf[3] = 0;
+		buf[4] = 0;
+		buf[5] = 0;
+		buf[6] = 0;
+#endif
+		subtype_mask = RAW_META_MASK_TCAL_POINTS;
+	} else {
+		return true;
+	}
+	if (esb_write(buf, false, RAW_PACKET_SIZE) != 0) return false;
+	return true;
 }
 
-/**
- * Send one calibration packet per call (drip-feed).
- * Returns true if a packet was sent, false if calibration is complete.
- */
-static bool connection_cal_drip_send(void)
+static bool connection_process_calibration_requests(void)
 {
 	if (!raw_cal_pending) {
 		return false;
 	}
-
-	uint8_t buf[RAW_PACKET_SIZE];
-	memset(buf, 0, sizeof(buf));
-	buf[0] = ESB_RAW_CAL_TYPE;
-	buf[1] = tracker_id;
-
-	switch (raw_cal_phase) {
-	case 0: /* Accel calibration */
-		buf[2] = RAW_CAL_SUB_ACCEL;
-		memcpy(&buf[3], retained->accBAinv, sizeof(retained->accBAinv));
-		esb_write(buf, false, RAW_PACKET_SIZE);
-		raw_cal_phase = 1;
-		return true;
-
-	case 1: { /* Mag calibration */
-		buf[2] = RAW_CAL_SUB_MAG;
-		float mag_BAinv[4][3];
-		float mag_body_BAinv[4][3];
-		magneto_online_snapshot_BAinv(mag_BAinv);
-		connection_align_mag_BAinv_body(mag_body_BAinv, mag_BAinv);
-		memcpy(&buf[3], mag_body_BAinv, sizeof(mag_body_BAinv));
-		esb_write(buf, false, RAW_PACKET_SIZE);
-		raw_cal_phase = 2;
-		return true;
-	}
-
-	case 2: /* Gyro calibration */
-		buf[2] = RAW_CAL_SUB_GYRO;
-		memcpy(&buf[3], retained->gyroBias, sizeof(retained->gyroBias));
-		memcpy(&buf[15], retained->gyroSensScale, sizeof(retained->gyroSensScale));
-		esb_write(buf, false, RAW_PACKET_SIZE);
-#if CONFIG_SENSOR_USE_TCAL
-		raw_cal_phase = 3;
-#else
-		raw_cal_pending = false;
-#endif
-		return true;
-
-#if CONFIG_SENSOR_USE_TCAL
-	case 3: { /* T-Cal state */
-		buf[2] = RAW_CAL_SUB_TCAL;
-		/*
-		 * buf[3] flags (compat: non-zero ⇒ compensation flag on):
-		 *   bit0 = tcal_enabled
-		 *   bit1 = curve actively applied (enough points)
-		 *   bit2 = enabled but ZRO fallback (insufficient points)
-		 */
-		uint8_t tcal_flags = 0;
-		if (retained->tcal_enabled) {
-			tcal_flags |= 0x01;
-		}
-		switch (sensor_tcal_get_apply_mode()) {
-		case SENSOR_TCAL_APPLY_CURVE:
-			tcal_flags |= 0x02;
-			break;
-		case SENSOR_TCAL_APPLY_ZRO_FALLBACK:
-			tcal_flags |= 0x04;
-			break;
-		default:
-			break;
-		}
-		buf[3] = tcal_flags;
-		uint16_t npoints = connection_tcal_valid_point_count();
-		memcpy(&buf[4], &npoints, 2);
-		float temp_min = (float)CONFIG_SENSOR_POLY_TEMP_MIN;
-		float temp_max = (float)CONFIG_SENSOR_POLY_TEMP_MAX;
-		memcpy(&buf[6], &temp_min, 4);
-		memcpy(&buf[10], &temp_max, 4);
-		/* [14]: apply mode enum; rest of former correction-offset area zeroed */
-		memset(&buf[14], 0, 12);
-		buf[14] = (uint8_t)sensor_tcal_get_apply_mode();
-		esb_write(buf, false, RAW_PACKET_SIZE);
-		if (npoints > 0) {
-			raw_cal_phase = 4;
-			raw_cal_point_idx = 0;
-			raw_cal_chunk_idx = 0;
-		} else {
-			raw_cal_pending = false;
-		}
-		return true;
-	}
-
-	case 4: { /* T-Cal points (2 per packet) */
-		uint16_t total_count = connection_tcal_valid_point_count();
-		if (raw_cal_point_idx >= TCAL_BUFFER_SIZE || total_count == 0) {
-			raw_cal_pending = false;
-			return false;
-		}
-
-		buf[2] = RAW_CAL_SUB_TCAL_POINTS;
-		buf[3] = raw_cal_chunk_idx;
-		memcpy(&buf[4], &total_count, 2);
-		uint8_t n = 0;
-		while (raw_cal_point_idx < TCAL_BUFFER_SIZE && n < 2) {
-			const struct TempCalPoint *point = &retained->tempCalPoints[raw_cal_point_idx++];
-
-			if (!connection_tcal_point_valid(point)) {
-				continue;
-			}
-
-			memcpy(&buf[7 + n * 16], point, sizeof(*point));
-			n++;
-		}
-
-		if (n == 0) {
-			raw_cal_pending = false;
-			return false;
-		}
-
-		buf[6] = n;
-		esb_write(buf, false, RAW_PACKET_SIZE);
-		raw_cal_chunk_idx++;
-		if (raw_cal_point_idx >= TCAL_BUFFER_SIZE) {
-			raw_cal_pending = false;
-		}
-		return true;
-	}
-#endif
-
-	default:
+	uint8_t selected = raw_cal_pending_mask;
+	if (selected == 0) {
 		raw_cal_pending = false;
 		return false;
 	}
-}
-
-bool connection_raw_metadata_resend_due(void)
-{
-	if (!connection_get_data_collection() || !raw_metadata_sent) {
+	/* Ascending bits send state before its point blocks. */
+	uint8_t subtype = selected & (uint8_t)(0U - selected);
+	if (!connection_send_calibration_mask(subtype, raw_cal_pending_chunk)) {
 		return false;
 	}
-	return (k_uptime_get() - raw_metadata_last_ms) >= RAW_METADATA_RESEND_MS;
+	if (subtype == RAW_META_MASK_TCAL_POINTS && raw_cal_points_all
+	    && (uint16_t)(raw_cal_pending_chunk + 1U) * 2U < raw_cal_snapshot.tcal_count) {
+		raw_cal_pending_chunk++;
+	} else {
+		raw_cal_pending_mask &= (uint8_t)~subtype;
+		if (subtype == RAW_META_MASK_TCAL_POINTS) {
+			raw_cal_points_all = false;
+		}
+	}
+	raw_cal_pending = raw_cal_pending_mask != 0;
+	return true;
 }
 
 bool connection_process_raw_data(void)
 {
-	if (!connection_get_data_collection()) {
+	if (!connection_raw_collection_active() || !atomic_get(&raw_snapshot_ready)) {
 		return false;
+	}
+	if (!raw_metadata_pending && !raw_cal_pending) {
+		k_spinlock_key_t key = k_spin_lock(&raw_request_lock);
+		uint8_t mask = raw_request_mask;
+		uint8_t chunk = raw_request_chunk;
+		raw_request_mask = 0;
+		k_spin_unlock(&raw_request_lock, key);
+		if (mask) {
+			connection_schedule_calibration(mask, chunk);
+		}
 	}
 
 	/* Priority 1: Process retransmit requests from ARQ ACK payloads */
 	uint16_t retx_seq = 0;
 	bool have_retx = false;
-	{
+	if (!connection_get_data_collection_batch()) {
 		unsigned irq_key = irq_lock();
-		if (raw_retx_count > 0) {
-			retx_seq = raw_retx_queue[0];
-			have_retx = true;
-			for (uint8_t i = 0; i + 1 < raw_retx_count; i++) {
-				raw_retx_queue[i] = raw_retx_queue[i + 1];
-			}
-			raw_retx_count--;
-		}
+		have_retx = raw_retx_take(&raw_retx, &retx_seq);
 		irq_unlock(irq_key);
 	}
 	if (have_retx) {
-		uint16_t idx = retx_seq % RAW_RING_SIZE;
-
-		if (raw_ring_valid[idx] && raw_ring_seq[idx] == retx_seq) {
+		uint8_t *packet = raw_ring_get(retx_seq);
+		if (packet != NULL) {
 			/* Retransmit from ring buffer */
-			esb_write(raw_ring[idx], false, RAW_PACKET_SIZE);
+			int err = esb_write(packet, false, RAW_PACKET_SIZE);
+			if (err != 0) {
+				k_msleep(1);
+			}
 			raw_retx_total++;
 		}
 		return true;
 	}
 
-	/* Priority 2: Deferred metadata and calibration drip.
-	 * Rate-limited to 1 packet per RAW_META_CAL_DRIP_MS so meta/cal
-	 * never bursts the ESB TX FIFO when interleaved with IMU data.
-	 * Metadata is buffered by sensor thread and sent here to avoid
-	 * cross-thread esb_write() contention. */
+	/* Priority 2: metadata and stable calibration requests. Admission failures
+	 * leave the exact packet selected and are retried after the pacing interval. */
 	if (raw_metadata_pending || raw_cal_pending) {
 		int64_t now = k_uptime_get();
-		if (now - raw_meta_cal_last_ms >= RAW_META_CAL_DRIP_MS) {
+		int64_t drip_ms = connection_raw_collection_startup_done() ? 200 : 50;
+		if (now - raw_meta_cal_last_ms >= drip_ms) {
+			bool sent;
 			if (raw_metadata_pending) {
-				esb_write(raw_metadata_buf, false, RAW_PACKET_SIZE);
-				raw_metadata_pending = false;
-				raw_metadata_sent = true;
-				raw_metadata_last_ms = now;
+				sent = esb_write(raw_metadata_buf, false, RAW_PACKET_SIZE) == 0;
+				if (sent) { raw_metadata_pending = false; raw_metadata_sent = true; }
 			} else {
-				connection_cal_drip_send();
-				k_usleep(600);
+				sent = connection_process_calibration_requests();
 			}
 			raw_meta_cal_last_ms = now;
-			return true;
+			if (sent) return true;
+			k_msleep(1);
 		}
-		/* Throttled — fall through to IMU data if metadata already sent */
 	}
 
 	/* Wait for metadata before sending data */
-	if (!raw_metadata_sent) {
-		return false;
-	}
-
+	/* Metadata may be queued immediately, but raw samples are not admitted
+	 * until the complete five-second startup window has elapsed. */
+	if (!connection_raw_collection_startup_done()) return false;
+	if (!raw_metadata_sent) return false;
 	/* Priority 3: Send new IMU sample */
 	struct raw_imu_queued sample;
 	if (k_msgq_get(&raw_imu_msgq, &sample, K_NO_WAIT) == 0) {
+		/* A collection reset purges the queue, but a producer can be
+		 * preempted between its active check and k_msgq_put(). Reject such
+		 * a stale sample instead of leaking it into the new session. */
+		if (sample.session != (uint32_t)atomic_get(&raw_collection_session)) {
+			return true;
+		}
+
 		uint8_t buf[RAW_PACKET_SIZE];
 		memset(buf, 0, sizeof(buf));
 
@@ -1135,20 +1235,16 @@ bool connection_process_raw_data(void)
 		memcpy(&buf[8], &sample.gyr_quat[1], 4);
 		memcpy(&buf[12], &sample.gyr_quat[2], 4);
 		memcpy(&buf[16], &sample.gyr_quat[3], 4);
-
 		/* Accel float × 3 */
 		memcpy(&buf[20], &sample.accel[0], 4);
 		memcpy(&buf[24], &sample.accel[1], 4);
 		memcpy(&buf[28], &sample.accel[2], 4);
-
-		/* Piggyback latest mag if available */
 		uint8_t flags = 0;
-		float mag_snap[3];
+		float mag_snap[3] = {0};
 		bool mag_ok = false;
 		{
 			k_spinlock_key_t key = k_spin_lock(&latest_mag_lock);
-			if (latest_mag_valid
-			    && latest_mag_session == (uint32_t)atomic_get(&raw_collection_session)) {
+			if (latest_mag_valid && latest_mag_session == (uint32_t)atomic_get(&raw_collection_session)) {
 				memcpy(mag_snap, latest_mag, sizeof(mag_snap));
 				mag_ok = true;
 			}
@@ -1159,19 +1255,22 @@ bool connection_process_raw_data(void)
 			memcpy(&buf[32], &mag_snap[0], 4);
 			memcpy(&buf[36], &mag_snap[1], 4);
 			memcpy(&buf[40], &mag_snap[2], 4);
-			flags |= 0x01; /* has_new_mag */
+			flags |= 0x01;
 		}
-
 		buf[44] = flags;
 		memcpy(&buf[45], &sample.temp_c, sizeof(sample.temp_c));
 
-		/* Save to ring buffer for potential retransmission */
-		uint16_t ring_idx = seq % RAW_RING_SIZE;
-		memcpy(raw_ring[ring_idx], buf, RAW_PACKET_SIZE);
-		raw_ring_seq[ring_idx] = seq;
-		raw_ring_valid[ring_idx] = true;
+		/* Only reliable single-target collection retains ARQ history. */
+		if (!connection_get_data_collection_batch()) {
+			raw_ring_store(buf);
+		}
 
-		esb_write(buf, false, RAW_PACKET_SIZE);
+		int err = esb_write(buf, false, RAW_PACKET_SIZE);
+		if (err != 0) {
+			/* Batch mode intentionally drops FIFO/admission failures; all
+			 * failed sends still yield before the next queued sample. */
+			k_msleep(1);
+		}
 		return true;
 	}
 
@@ -1249,26 +1348,41 @@ static uint64_t test_rate_delay_us(uint64_t now_us)
  * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub0_type][sub0_data...]
  *         [sub1_type][sub1_data...]...[sequence]
  */
-static bool send_composite(const uint8_t *types, int n)
+static bool send_composite(const struct composite_builder *builder)
 {
 	uint8_t buf[ESB_MAX_PAYLOAD_LEN];
 	int pos = 0;
-
+	/* An event is only a tail of real business data, never a replacement pose.
+	 * Reject an empty builder without completing its event token: the event
+	 * remains pending for a later pose (or a normal-mode standalone send). */
+	if (builder->n <= 0 || builder->n > ARRAY_SIZE(builder->types)) {
+		return false;
+	}
 	buf[pos++] = ESB_COMPOSITE_TYPE;
 	buf[pos++] = tracker_id;
-	buf[pos++] = (uint8_t)n;
-
-	for (int i = 0; i < n; i++) {
-		uint8_t t = types[i];
-		buf[pos++] = t;
-		const struct sub_packet_desc *d = sub_packet_get(t);
-		if (d) {
-			pos += d->fill(&buf[pos]);
+	buf[pos++] = (uint8_t)(builder->n + builder->has_event);
+	for (int i = 0; i < builder->n; i++) {
+		const struct sub_packet_desc *d = sub_packet_get(builder->types[i]);
+		if (!d || pos + 1 + d->data_len + 1 > sizeof(buf)) {
+			return false;
 		}
+		buf[pos++] = builder->types[i];
+		pos += d->fill(&buf[pos]);
 	}
-
+	if (builder->has_event) {
+		if (pos + 16 + 1 > sizeof(buf)) {
+			return false;
+		}
+		buf[pos++] = TRACKER_EVENT_ESB_TYPE;
+		memcpy(&buf[pos], &builder->event.packet[2], 15);
+		pos += 15;
+	}
 	buf[pos++] = packet_sequence;
-	if (esb_write(buf, no_ack, pos) != 0) {
+	int err = esb_write(buf, no_ack, pos);
+	if (builder->has_event) {
+		tracker_events_complete(builder->event.token, err == 0, k_uptime_get_32());
+	}
+	if (err != 0) {
 		return false;
 	}
 	packet_sequence++;
@@ -1279,6 +1393,7 @@ static void composite_builder_reset(struct composite_builder *builder)
 {
 	builder->n = 0;
 	builder->used = 0;
+	builder->has_event = false;
 	memset(builder->last_times, 0, sizeof(builder->last_times));
 }
 
@@ -1289,7 +1404,8 @@ static void composite_builder_reset(struct composite_builder *builder)
 static bool composite_try_add(struct composite_builder *builder, uint8_t type)
 {
 	int need = 1 + sub_data_len(type); /* 1 for type byte + data */
-	if (builder->used + need > COMPOSITE_MAX_SUB_DATA) {
+	if (!sub_packet_get(type) || builder->n >= ARRAY_SIZE(builder->types)
+		|| builder->used + need > COMPOSITE_MAX_SUB_DATA) {
 		return false;
 	}
 	builder->types[builder->n] = type;
@@ -1324,9 +1440,14 @@ static void composite_commit_timestamps(const struct composite_builder *builder)
 	}
 }
 
-static bool send_composite_or_single(const struct composite_builder *builder, uint8_t fallback_type)
+static bool send_composite_or_single(struct composite_builder *builder, uint8_t fallback_type)
 {
-	if (builder->n > 1) {
+	/* Private event data is never a normal sub-packet or a direct-HID mirror. */
+	if (esb_ready() && builder->n > 0 && builder->used + 16 <= COMPOSITE_MAX_SUB_DATA
+		&& !esb_ota_is_active() && !get_status(SYS_STATUS_CONNECTION_ERROR)) {
+		builder->has_event = tracker_events_select(k_uptime_get_32(), tracker_id, &builder->event);
+	}
+	if (builder->n > 1 || builder->has_event) {
 		if (!esb_ready()) {
 #if CONFIG_CONNECTION_OVER_HID
 			/* Radio unavailable: HID is the configured output path;
@@ -1339,7 +1460,7 @@ static bool send_composite_or_single(const struct composite_builder *builder, ui
 
 		/* Radio available: only ESB queue success counts, so a failed
 		 * admission cannot advance the schedule or mirror to HID. */
-		if (!send_composite(builder->types, builder->n)) {
+		if (!send_composite(builder)) {
 			return false;
 		}
 #if CONFIG_CONNECTION_OVER_HID
@@ -1353,6 +1474,42 @@ static bool send_composite_or_single(const struct composite_builder *builder, ui
 static void connection_signal_wake(void)
 {
 	k_sem_give(&connection_wake_sem);
+}
+
+void connection_tracker_event_wake(void)
+{
+	connection_signal_wake();
+}
+
+/* True means an admission was attempted, not that the receiver received it. */
+static bool connection_send_tracker_event(void)
+{
+	struct tracker_event_tx event;
+	if (!esb_ready() || test_mode_get() || esb_ota_is_active()
+		|| get_status(SYS_STATUS_CONNECTION_ERROR)
+		|| !tracker_events_select(k_uptime_get_32(), tracker_id, &event)) {
+		return false;
+	}
+	int err = esb_write(event.packet, true, sizeof(event.packet));
+	tracker_events_complete(event.token, err == 0, k_uptime_get_32());
+	if (err != 0) {
+		/* The core defers another event attempt by at least 10ms. */
+		k_msleep(1);
+	}
+	return true;
+}
+
+/* A packet refused by ESB admission is rebuilt from the live snapshot and
+ * retried. Retrying a millisecond later is only useful while TDMA can still
+ * admit soon: with receiver time missing or stale every attempt is refused
+ * before the ESB FIFO, and that tight retry turned a receiver outage into
+ * ~800 hopeless writes per second for as long as it lasted. */
+#define SEND_RETRY_MS 1
+#define SEND_RETRY_STALLED_MS 10
+
+static uint32_t connection_send_retry_ms(void)
+{
+	return tdma_admission_stalled() ? SEND_RETRY_STALLED_MS : SEND_RETRY_MS;
 }
 
 static int64_t connection_next_deadline_ms(int64_t now)
@@ -1380,6 +1537,17 @@ static int64_t connection_next_deadline_ms(int64_t now)
 		}
 	}
 	if (!test_mode_get()) {
+		/* Test mode only piggybacks events on scheduled poses. An already-due
+		 * event cannot shorten that wait or it would keep this thread spinning. */
+		if (esb_ready() && !esb_ota_is_active() && !get_status(SYS_STATUS_CONNECTION_ERROR)) {
+			uint32_t event_deadline = tracker_events_deadline((uint32_t)now);
+			if (event_deadline != UINT32_MAX) {
+				int64_t e_dl = now + (int32_t)(event_deadline - (uint32_t)now);
+				if (e_dl < deadline) {
+					deadline = e_dl;
+				}
+			}
+		}
 		if (sensor_data_snapshot_m_pending(&sensor_data_snapshot)) {
 			int64_t m_dl = last_mag_time + 100;
 			if (m_dl < deadline) {
@@ -1491,9 +1659,24 @@ void connection_thread(void)
 				|| (guarded_schedule ? ping_window_delay_ms == 0
 					: (int32_t)((uint32_t)now - ping_deadline) >= 0);
 			if (ping_due) {
-				enum tdma_ping_admission admission = force_resync
-					? TDMA_PING_UNAVAILABLE : tdma_wait_for_ping_window();
-				if (!force_resync && admission == TDMA_PING_DEFERRED) {
+				uint8_t ping[ESB_PING_LEN] = {0};
+				ping[0] = ESB_PING_TYPE;
+				ping[1] = connection_get_id();
+				uint8_t ping_ack_flag = esb_get_ping_ack_flag();
+				ping[7] = ping_ack_flag;
+				if (ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON) {
+					uint16_t tps = test_mode_get_target_tps();
+					ping[8] = (tps >> 8) & 0xFF;
+					ping[9] = tps & 0xFF;
+				} else if (ping_ack_flag == ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON) {
+					ping[8] = (uint8_t)connection_get_data_collection_batch_rate();
+				} else if (ping_ack_flag == ESB_PONG_FLAG_DATA_COLLECT_METADATA) {
+					uint8_t request[4];
+					esb_get_ping_request_data(request);
+					memcpy(&ping[8], request, sizeof(request));
+				}
+				int err = esb_write_ping(ping, force_resync);
+				if (err == -EAGAIN) {
 					uint32_t retry_delay_ms = 0;
 					if (tdma_ping_wake_delay_ms(&retry_delay_ms)) {
 						atomic_set(&next_ping_deadline_ms, (atomic_val_t)((uint32_t)now + retry_delay_ms));
@@ -1509,18 +1692,6 @@ void connection_thread(void)
 					);
 					atomic_set(&next_ping_deadline_ms, (atomic_val_t)ping_deadline);
 				}
-
-				uint8_t ping[ESB_PING_LEN] = {0};
-				ping[0] = ESB_PING_TYPE;
-				ping[1] = connection_get_id();
-				uint8_t ping_ack_flag = esb_get_ping_ack_flag();
-				ping[7] = ping_ack_flag;
-				if (ping_ack_flag == ESB_PONG_FLAG_TEST_MODE_ON) {
-					uint16_t tps = test_mode_get_target_tps();
-					ping[8] = (tps >> 8) & 0xFF;
-					ping[9] = tps & 0xFF;
-				}
-				int err = esb_write(ping, false, ESB_PING_LEN);
 				if (err == 0) {
 					atomic_inc(&ping_sched_stats.queue_ok);
 				} else {
@@ -1562,16 +1733,14 @@ void connection_thread(void)
 				}
 			}
 
-			/* Skip sensor data during connection error */
+			/* Connection-loss shutdown is independent of metadata repair. */
 			if (get_status(SYS_STATUS_CONNECTION_ERROR)) {
-				/* Auto-stop data collection after prolonged connection error
-				 * to avoid indefinite battery drain and stuck state. */
-				if (connection_get_data_collection()) {
-					static int64_t dc_conn_error_start;
+				if (connection_raw_collection_active()) {
 					if (dc_conn_error_start == 0) {
 						dc_conn_error_start = now;
 					} else if (now - dc_conn_error_start > 60000) {
 						connection_set_data_collection(false);
+						connection_set_data_collection_batch(false, 0);
 						test_mode_set(false);
 						dc_conn_error_start = 0;
 						LOG_WRN("Data collection auto-stopped (connection error for 60s)");
@@ -1580,8 +1749,14 @@ void connection_thread(void)
 				k_msleep(100);
 				continue;
 			}
+			dc_conn_error_start = 0;
 
-			/* Raw data has priority over fusion data to minimize latency */
+			/* Raw streams yield one admission to a due event; test mode may
+			 * only carry events on its scheduled real pose packet. */
+			if (connection_raw_collection_active() && connection_send_tracker_event()) {
+				continue;
+			}
+			/* Otherwise raw data retains its existing priority. */
 			if (connection_process_raw_data()) {
 				continue;
 			}
@@ -1589,7 +1764,7 @@ void connection_thread(void)
 
 		/* During data collection, throttle fusion data
 		 * to leave radio bandwidth for raw data. */
-		if (radio_ready && connection_get_data_collection()) {
+		if (radio_ready && connection_raw_collection_active()) {
 			static int64_t last_fusion_dc_time;
 			if (now - last_fusion_dc_time < 9) {
 				k_usleep(300);
@@ -1614,10 +1789,10 @@ void connection_thread(void)
 		/* In test mode all low-frequency data rides the next target-rate
 		 * packet. Standalone sends would violate the configured ceiling. */
 		bool mag_due = !in_test_mode && sensor_data_snapshot_m_pending(&sensor_data_snapshot)
-			&& (now - last_mag_time > 100);
-		bool info_due = !in_test_mode && sensor_ids_set && (now - last_info_time > 100);
-		bool status_due = !in_test_mode && (now - last_status_time > 1000);
-		bool runtime_due = !in_test_mode && (now - last_runtime_time > 1000);
+			&& (now - last_mag_time >= 100);
+		bool info_due = !in_test_mode && sensor_ids_set && (now - last_info_time >= 100);
+		bool status_due = !in_test_mode && (now - last_status_time >= 1000);
+		bool runtime_due = !in_test_mode && (now - last_runtime_time >= 1000);
 
 		/* Low-frequency fields may always piggyback on a quat/test packet. */
 		bool info_soon = sensor_ids_set && (now - last_info_time > 100 - COMPOSITE_LOOKAHEAD_MS);
@@ -1632,28 +1807,28 @@ void connection_thread(void)
 
 		if (quat_ready) {
 			struct composite_builder builder;
-			uint8_t fallback_type = 1;
+			uint8_t fallback_type = SUB_PACKET_QUAT_ACCEL;
 			composite_builder_reset(&builder);
 
 			/* Primary: quat sub-packet */
 			if (mag_wanted) {
 				/* mag includes full quat, use type 4 instead of separate quat+mag */
-				composite_try_add_due(&builder, 4, true, &last_mag_time, now);
-				fallback_type = 4;
+				composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
+				fallback_type = SUB_PACKET_QUAT_MAG;
 			} else if (!connection_sensor_get_precise_quat() && info_wanted) {
 				/* compact quat (type 2) contains batt/temp but NOT imu_id/mag_id.
 				 * Don't update last_info_time here so that a real type 0 info
 				 * sub-packet is still piggybacked to keep IMU model visible. */
-				composite_try_add(&builder, 2);
-				fallback_type = 2;
+				composite_try_add(&builder, SUB_PACKET_COMPACT_QUAT);
+				fallback_type = SUB_PACKET_COMPACT_QUAT;
 			} else {
-				composite_try_add(&builder, 1);
+				composite_try_add(&builder, SUB_PACKET_QUAT_ACCEL);
 			}
 
 			/* Piggyback low-freq sub-packets if they fit */
-			composite_try_add_due(&builder, 3, status_wanted, &last_status_time, now);
-			composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-			composite_try_add_due(&builder, 0, info_wanted, &last_info_time, now);
+			composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
+			composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
+			composite_try_add_due(&builder, SUB_PACKET_INFO, info_wanted, &last_info_time, now);
 
 			if (send_composite_or_single(&builder, fallback_type)) {
 				/* Only a successfully queued packet consumes the test-rate
@@ -1663,64 +1838,34 @@ void connection_thread(void)
 					test_rate_advance(k_ticks_to_us_near64(k_uptime_ticks()));
 				}
 				composite_commit_timestamps(&builder);
+			} else {
+				k_msleep(connection_send_retry_ms());
 			}
 			continue;
 		}
 
-		/* No quat ready — handle standalone low-freq packets */
-		if (mag_due) {
-			/* Mag with optional low-frequency piggyback */
-			if (status_wanted || runtime_wanted) {
-				struct composite_builder builder;
-				composite_builder_reset(&builder);
-				composite_try_add_due(&builder, 4, true, &last_mag_time, now);
-				composite_try_add_due(&builder, 3, status_wanted, &last_status_time, now);
-				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-				if (send_composite_or_single(&builder, 4)) {
-					composite_commit_timestamps(&builder);
-				}
-			} else if (connection_write_packet_4()) {
-				last_mag_time = now;
+		/* No quat ready: all low-frequency packets may carry an event tail. */
+		if (mag_due || info_due || status_due || runtime_due) {
+			struct composite_builder builder;
+			composite_builder_reset(&builder);
+			uint8_t primary = mag_due ? SUB_PACKET_QUAT_MAG
+				: info_due ? SUB_PACKET_INFO
+				: status_due ? SUB_PACKET_STATUS : SUB_PACKET_RUNTIME;
+			if (mag_due) {
+				composite_try_add_due(&builder, SUB_PACKET_QUAT_MAG, true, &last_mag_time, now);
+			} else if (info_due) {
+				composite_try_add_due(&builder, SUB_PACKET_INFO, true, &last_info_time, now);
+			}
+			composite_try_add_due(&builder, SUB_PACKET_STATUS, status_wanted, &last_status_time, now);
+			composite_try_add_due(&builder, SUB_PACKET_RUNTIME, runtime_wanted, &last_runtime_time, now);
+			if (send_composite_or_single(&builder, primary)) {
+				composite_commit_timestamps(&builder);
+			} else {
+				k_msleep(connection_send_retry_ms());
 			}
 			continue;
 		}
-
-		if (info_due) {
-			/* Info with optional low-frequency piggyback */
-			if (status_wanted || runtime_wanted) {
-				struct composite_builder builder;
-				composite_builder_reset(&builder);
-				composite_try_add_due(&builder, 0, true, &last_info_time, now);
-				composite_try_add_due(&builder, 3, status_wanted, &last_status_time, now);
-				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-				if (send_composite_or_single(&builder, 0)) {
-					composite_commit_timestamps(&builder);
-				}
-			} else if (connection_write_packet_0()) {
-				last_info_time = now;
-			}
-			continue;
-		}
-
-		if (status_due) {
-			if (runtime_wanted) {
-				struct composite_builder builder;
-				composite_builder_reset(&builder);
-				composite_try_add_due(&builder, 3, true, &last_status_time, now);
-				composite_try_add_due(&builder, 5, runtime_wanted, &last_runtime_time, now);
-				if (send_composite_or_single(&builder, 3)) {
-					composite_commit_timestamps(&builder);
-				}
-			} else if (connection_write_packet_3()) {
-				last_status_time = now;
-			}
-			continue;
-		}
-
-		if (runtime_due) {
-			if (connection_write_packet_5()) {
-				last_runtime_time = now;
-			}
+		if (connection_send_tracker_event()) {
 			continue;
 		}
 

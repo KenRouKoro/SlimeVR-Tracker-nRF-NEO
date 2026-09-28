@@ -55,10 +55,8 @@ typedef struct {
 	bool cache_valid;
 	int samples_since_recompute;
 } mag_center_estimator_t;
-
-/* magBAinv: calibration.c; aBuf: cal_sample.c; magneto_progress: cal_mag.c */
+/* magBAinv: calibration.c; magneto_progress: cal_mag.c */
 extern float magBAinv[4][3];
-extern float aBuf[3];
 extern uint8_t magneto_progress;
 
 void magneto_center_reset(mag_center_estimator_t *estimator);
@@ -76,7 +74,12 @@ bool magneto_quality_check(double *ata_buf, double norm_sum_val, double sample_c
 			   int min_samples, float m_inv_out[][3]);
 
 /*
- * Structural magBAinv gate shared by validate / quality / blend.
+ * Structural magBAinv gate shared by stored/manual/online calibration paths.
+ * Requires finite coefficients and a symmetric positive definite correction,
+ * in addition to the bias, diagonal-spread and maximum-axis-gain bounds.
+ * Symmetry and normalized LDL^T pivots use a 16*FLT_EPSILON roundoff margin;
+ * zero, negative and numerically singular corrections are not calibrations.
+ * Zero bias is valid; identity/default model provenance is the caller's policy.
  * bias_limit <= 0 → derive from diagonal magnitude * 2 (stored-cal path).
  * Callers with sample field strength pass hm * 2.
  */

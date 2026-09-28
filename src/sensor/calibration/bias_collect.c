@@ -184,8 +184,8 @@ int sensor_offsetBias_internal(
 #endif
 
 		// Check accelerometer motion periodically (not every loop iteration).
-		// Must not block: sensor_wait_gyro is a mailbox; waiting on accel drops
-		// ~1/accel_odr of gyro samples per check and halves collect rate
+		// Do not wait for accel here: keep draining the bounded gyro FIFO while
+		// observing the independent, live accel snapshot for motion.
 		if (accel_check_counter >= accel_check_interval) {
 			if (sensor_peek_accel(rawData)) {
 				// Check Accel Motion (Min/Max method)
@@ -299,7 +299,7 @@ int sensor_offsetBias_internal(
 			(double)wait_gyro_odr,
 			min_sample_time_ms
 		);
-		return -2;
+		return BIAS_COLLECT_INSUFFICIENT_SAMPLES;
 	}
 
 #if CONFIG_SENSOR_USE_TCAL

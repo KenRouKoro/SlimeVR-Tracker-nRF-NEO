@@ -83,6 +83,18 @@ void esb_clear_pair(void);
 
 void esb_process_ota_rx_queue(void);
 int esb_write(uint8_t *data, bool no_ack, size_t data_length);
+/* Start the clock before guarded admission; -EAGAIN defers with HFXO warm.
+ * force_resync bypasses admission for unslotted startup recovery. */
+int esb_write_ping(uint8_t *data, bool force_resync);
+
+/**
+ * Coherent, read-only status clock snapshot (both output pointers required).
+ * Always fills local_ticks with low32 local time in the fixed 32768 Hz domain.
+ * network_ticks defaults to local_ticks; true means a paired, error-free
+ * connection with valid runtime TDMA config and a fresh accepted time sync.
+ * A synchronized network_ticks value of zero is valid. No epoch unwrapping.
+ */
+bool esb_get_status_clock(uint32_t *local_ticks, uint32_t *network_ticks);
 
 #define PING_INTERVAL_MS 997
 // Ping/Pong types for ACK payload validation
@@ -140,13 +152,18 @@ int esb_write(uint8_t *data, bool no_ack, size_t data_length);
 #define ESB_PONG_FLAG_OTA_ABORT 0x31        // Abort ESB OTA update
 #define ESB_PONG_FLAG_OTA_SUPPRESS 0x32     // Suppress tracker during OTA (reduce poll rate)
 #define ESB_PONG_FLAG_OTA_UNSUPPRESS 0x33   // Resume normal poll rate after OTA
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_ON 0x34  // Start batch raw data collection (data[8] = target Hz, 0 = accel ODR)
+#define ESB_PONG_FLAG_DATA_COLLECT_BATCH_OFF 0x35 // Stop batch raw data collection
+#define ESB_PONG_FLAG_DATA_COLLECT_METADATA 0x36 // Request metadata/calibration mask/chunk; token bytes 10-11
 
 // Raw data collection packet types
 // DEPRECATED on tracker: ESB_RAW_IMU/MAG unused; live TX is ESB_RAW_IMU_QUAT_TYPE.
 // Kept for wire-format docs / receiver + analyzer compatibility.
 #define ESB_RAW_IMU_TYPE    0x10  // DEPRECATED: legacy raw IMU (float)
 #define ESB_RAW_MAG_TYPE    0x11  // DEPRECATED: reserved raw mag
-#define ESB_RAW_META_TYPE   0x12  // Metadata (ODR, range, sensor IDs - sent once)
+// Metadata (ODR, range, sensor IDs): captured once per collection session,
+// sent at session start, and replayed on explicit requests.
+#define ESB_RAW_META_TYPE   0x12
 #define ESB_RAW_IMU_QUAT_TYPE 0x13  // Raw IMU with gyrQuat (packet-loss resistant)
 #define ESB_RAW_CAL_TYPE    0x14  // Extended calibration metadata (sub-typed)
 
@@ -171,6 +188,7 @@ int esb_write(uint8_t *data, bool no_ack, size_t data_length);
 bool esb_ready(void);
 
 // Get remote command flag to echo back in PING
+void esb_get_ping_request_data(uint8_t out[4]);
 uint8_t esb_get_ping_ack_flag(void);
 
 // Additional delay applied to the base ping interval after repeated failures.
