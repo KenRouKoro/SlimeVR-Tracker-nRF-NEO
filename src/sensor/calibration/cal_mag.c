@@ -26,6 +26,7 @@
 #include "system/system.h"
 #include "system/watchdog.h"
 #include "util.h"
+#include <errno.h>
 
 #include <math.h>
 #include <string.h>
@@ -40,22 +41,33 @@
 #include "cal_mag.h"
 #include "cal_sample.h"
 #include "calibration.h"
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 #include "mag_common.h"
 #include "online_mag.h"
+#endif
 
 LOG_MODULE_REGISTER(cal_mag, LOG_LEVEL_INF);
 
-/* Owned here; declared in mag_common.h for online_mag / calibration glue. */
-uint8_t magneto_progress;
-static uint8_t last_magneto_progress;
-static int64_t magneto_progress_time;
-
-static int64_t mag_cal_last_status_log;
-/* Highest coverage percent already reported to the calibration events. */
-static uint8_t manual_coverage_reported;
-
+union mag_cal_workspace mag_cal_workspace;
 double norm_sum;
 double sample_count;
+
+#if CONFIG_SENSOR_USE_MAGNETOMETER
+/* Owned here; declared in mag_common.h for online_mag / calibration glue. */
+uint8_t magneto_progress;
+
+static int64_t mag_cal_last_status_log;
+static uint8_t mag_cal_coverage;
+
+/* Chunked averaging for the manual Magneto least-squares feed. The direction
+ * gate and the center estimator still see every individual sample so diversity
+ * tracking stays sensitive; only the ATA feed is averaged to suppress the n^2
+ * noise bias. Target depth adapts to the detected magnetometer's noise. */
+#define MAG_CAL_AVG_MAX 8
+static int mag_cal_avg_target = 1;
+static float mag_cal_avg_buf[MAG_CAL_AVG_MAX][3];
+static int mag_cal_avg_count;
+
 
 /* Direction range tracking for manual calibration: per-axis min/max of normalized direction */
 static float dir_min[3];
@@ -63,21 +75,13 @@ static float dir_max[3];
 
 static mag_center_estimator_t manual_center_estimator;
 
-/* Manual calibration direction tracking (same cross-validation logic as online path) */
+/* Manual collection accepts changes in magnetic or trustworthy gravity direction. */
 static float manual_last_dir[3];
 static float manual_last_accel_dir[3];
 
-/* Chunked averaging for manual Magento LS feed (noise-adaptive via init_noise_params). */
-#define MAG_CAL_AVG_MAX 8
-static int mag_cal_avg_target = 1;
-static float mag_cal_avg_buf[MAG_CAL_AVG_MAX][3];
-static int mag_cal_avg_count;
-
-/* Biases / matrices owned by calibration.c */
-extern float magBAinv[4][3];
 static void magneto_update_dir_range(const float v[3]);
 static float magneto_min_dir_range(void);
-static void sensor_sample_mag_magneto_sample(const float m[3]);
+static void sensor_sample_mag_magneto_sample(const float m[3], float m_inv[4][3]);
 
 void sensor_calibration_init_noise_params(void)
 {
@@ -95,27 +99,36 @@ void sensor_calibration_init_noise_params(void)
 		(double)noise_mg, MAG_CAL_MIN_SAMPLES, mag_cal_avg_target);
 }
 
-static void manual_finish(uint16_t op, uint8_t phase, uint8_t reason)
+static void manual_finish(uint16_t op, struct led_token feedback, uint8_t phase, uint8_t reason)
 {
 	sensor_calibration_samples_end();
 	magneto_reset();
 	set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
-	set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
 	if (reason != CAL_REASON_NONE) {
+		sensor_calibration_result(feedback, LED_FAILED);
 		cal_event_end(op, CAL_OUTCOME_FAILED, phase, reason);
 	}
+	tracker_events_notify();
+}
+
+static void manual_cancelled(uint16_t op, struct led_token feedback)
+{
+	sensor_calibration_samples_end();
+	magneto_reset();
+	set_status(SYS_STATUS_CALIBRATION_RUNNING, false);
+	cal_event_end(op, CAL_OUTCOME_CANCELLED, CAL_PHASE_APPLY_PENDING, CAL_REASON_RESET);
+	sensor_calibration_result(feedback, LED_CANCELLED);
 	tracker_events_notify();
 }
 
 int sensor_calibrate_mag(void)
 {
 	const uint16_t op = sensor_calibration_current_operation();
-	float zero[3] = {0};
-	float live_snapshot[4][3];
-	magneto_online_snapshot_BAinv(live_snapshot);
-	if (v_diff_mag(live_snapshot[0], zero) != 0) {
-		manual_finish(op, CAL_PHASE_COLLECT, CAL_REASON_REPLACED);
-		return -1; // magnetometer calibration already exists
+	const struct led_token feedback = sensor_calibration_current_feedback();
+	const uint32_t generation = sensor_calibration_current_generation();
+	if (!sensor_calibration_generation_valid(generation)) {
+		manual_cancelled(op, feedback);
+		return -ECANCELED;
 	}
 
 	if (!get_status(SYS_STATUS_CALIBRATION_RUNNING)) {
@@ -123,24 +136,25 @@ int sensor_calibrate_mag(void)
 	}
 
 	float m[3];
+	float m_inv[4][3];
 	if (sensor_wait_mag(m, K_MSEC(1000))) {
-		manual_finish(op, CAL_PHASE_COLLECT, CAL_REASON_SAMPLE_TIMEOUT);
+		manual_finish(op, feedback, CAL_PHASE_COLLECT, CAL_REASON_SAMPLE_TIMEOUT);
 		return -1; // Timeout
 	}
-	sensor_sample_mag_magneto_sample(m); // 400us
+	sensor_sample_mag_magneto_sample(m, m_inv); // 400us
 	uint8_t coverage = (uint8_t)(fmaxf(0.0f, fminf(magneto_min_dir_range() / 2.0f, 1.0f)) * 10.0f) * 10;
-	if (coverage > manual_coverage_reported) {
-		manual_coverage_reported = coverage;
+	if (coverage > mag_cal_coverage) {
+		mag_cal_coverage = coverage;
 		cal_event_step(op, CAL_PHASE_COVERAGE, coverage);
 		tracker_events_notify();
 	}
 
-	// Periodic status log every 1 second. Note: the counter tracks accepted
-	// *orientations* (direction-gate + chunk averaging), not mag samples;
-	// the coverage values are what must grow for the calibration to proceed.
+	// Periodic status log every 1 second
 	int64_t now = k_uptime_get();
 	if (now - mag_cal_last_status_log >= 1000) {
 		mag_cal_last_status_log = now;
+		/* The counter tracks accepted *orientations* (direction gate plus chunk
+		 * averaging), not mag samples; the coverage values are what must grow. */
 		LOG_INF(
 			"Mag cal: %d samples collected (coverage dir=%.2f/%.2f raw=%.3f/%.3f G)",
 			(int)sample_count,
@@ -155,9 +169,9 @@ int sensor_calibrate_mag(void)
 		return 1; // Still collecting - signal caller to use short sleep
 	}
 
-	float m_inv[4][3];
 	LOG_INF("Calibrating magnetometer hard/soft iron offset");
 	cal_event_step(op, CAL_PHASE_FIT, 0);
+	sensor_calibration_stage(feedback, LED_PROCESSING);
 	tracker_events_notify();
 
 #if DEBUG
@@ -172,23 +186,15 @@ int sensor_calibrate_mag(void)
 	printk("norm_sum: %.2f, sample_count: %.0f\n", norm_sum, sample_count);
 #endif
 	wait_for_threads();
-	int err = magneto_current_calibration(m_inv, mag_cal_workspace.ata, norm_sum, sample_count);
-	if (!err) {
-		/* Generic Magneto uses mean raw norm as its fitted target. Normalize
-		 * only the magnetic correction matrix, leaving hard-iron bias intact. */
-		const float scale = (float)(.5 * sample_count / norm_sum);
-		for (unsigned i = 1; i < 4; i++) {
-			for (unsigned j = 0; j < 3; j++) {
-				m_inv[i][j] *= scale;
-			}
+	/* Generic Magneto uses mean raw norm as its fitted target. Normalize
+	 * only the magnetic correction matrix, leaving hard-iron bias intact. */
+	const float scale = (float)(.5 * sample_count / norm_sum);
+	for (unsigned i = 1; i < 4; i++) {
+		for (unsigned j = 0; j < 3; j++) {
+			m_inv[i][j] *= scale;
 		}
 	}
 	magneto_reset();
-	if (err) {
-		LOG_WRN("Magnetometer calibration failed: %d; previous calibration unchanged", err);
-		manual_finish(op, CAL_PHASE_FIT, CAL_REASON_FIT_ERROR);
-		return err;
-	}
 
 	LOG_INF("Magnetometer matrix:");
 	for (int i = 0; i < 3; i++) {
@@ -200,55 +206,51 @@ int sensor_calibrate_mag(void)
 			(double)m_inv[3][i]
 		);
 	}
-	if (sensor_calibration_validate_mag(m_inv, false)) {
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_SENSOR);
-		LOG_INF("Restoring previous calibration");
-		LOG_INF("Magnetometer matrix:");
-		magneto_online_snapshot_BAinv(live_snapshot);
-		for (int i = 0; i < 3; i++) {
-			LOG_INF(
-				"%.5f %.5f %.5f %.5f",
-				(double)live_snapshot[0][i],
-				(double)live_snapshot[1][i],
-				(double)live_snapshot[2][i],
-				(double)live_snapshot[3][i]
-			);
-		}
-		sensor_calibration_validate_mag(NULL, true); // additionally verify old calibration
-		manual_finish(op, CAL_PHASE_FIT, CAL_REASON_INVALID_MODEL);
-		return -1;
-	} else {
-		LOG_INF("Applying calibration");
-		cal_event_step(op, CAL_PHASE_APPLY_PENDING, 0);
-		tracker_events_notify();
-		magneto_online_replace_BAinv_and_reset(m_inv, op);
-		sensor_fusion_reset_mag_ref();
-		sensor_mag_ref_reset(); // Recompute magRef from new calibration
-								// fusion invalidation not necessary
+	sys_warm_transaction_begin();
+	if (!sensor_calibration_generation_valid(generation)) {
+		sys_warm_transaction_end(false);
+		manual_cancelled(op, feedback);
+		return -ECANCELED;
 	}
+	if (sensor_calibration_validate_mag(m_inv, false)) {
+		manual_finish(op, feedback, CAL_PHASE_FIT, CAL_REASON_INVALID_MODEL);
+		sys_warm_transaction_end(false);
+		return -1;
+	}
+	LOG_INF("Applying calibration");
+	cal_event_step(op, CAL_PHASE_APPLY_PENDING, 0);
+	tracker_events_notify();
+	sensor_calibration_online_mag_retained_clear();
+	magneto_online_replace_BAinv_and_reset(m_inv, op, feedback);
+	sensor_fusion_reset_mag_ref();
+	sensor_mag_ref_reset(); // Recompute magRef from new calibration
+							// fusion invalidation not necessary
 	int storage_err = sys_write(MAIN_MAG_BIAS_ID, &retained->magBAinv, m_inv, sizeof(retained->magBAinv));
+	magneto_online_feedback_storage(feedback, storage_err);
 	if (storage_err) {
 		cal_event_step(op, CAL_PHASE_STORAGE, CAL_REASON_STORAGE_ERROR);
 		tracker_events_notify();
 	}
+	sys_warm_transaction_end(false);
 
 	LOG_INF("Finished calibration");
-	manual_finish(op, CAL_PHASE_APPLY_PENDING, CAL_REASON_NONE);
-	set_led(SYS_LED_PATTERN_ONESHOT_COMPLETE, SYS_LED_PRIORITY_SENSOR);
+	manual_finish(op, feedback, CAL_PHASE_APPLY_PENDING, CAL_REASON_NONE);
 	sensor_refresh_sensor_ids(); // Refresh reported mag status after calibration
 	return 0;
 }
+#endif
 
 void magneto_reset(void)
 {
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	magneto_progress = 0;
-	last_magneto_progress = 0;
-	magneto_progress_time = 0;
 	mag_cal_last_status_log = 0;
-	manual_coverage_reported = 0;
+	mag_cal_coverage = 0;
+#endif
 	memset(mag_cal_workspace.ata, 0, sizeof(mag_cal_workspace.ata));
 	norm_sum = 0;
 	sample_count = 0;
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 	for (int i = 0; i < 3; i++) {
 		dir_min[i] = 2.0f;  // start high
 		dir_max[i] = -2.0f; // start low
@@ -258,8 +260,10 @@ void magneto_reset(void)
 	memset(manual_last_accel_dir, 0, sizeof(manual_last_accel_dir));
 	mag_cal_avg_count = 0;
 	memset(mag_cal_avg_buf, 0, sizeof(mag_cal_avg_buf));
+#endif
 }
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 /**
  * Update direction range tracking (min/max per axis of normalized direction).
  * Used only by manual calibration to ensure sufficient multi-axis rotation.
@@ -296,9 +300,10 @@ static float magneto_min_dir_range(void)
 	}
 	return min_range;
 }
+#endif
 
-#if CONFIG_SENSOR_USE_6_SIDE_CALIBRATION
-// Target number of samples, 6 faces + 12 edges
+#if CONFIG_SENSOR_USE_ACCEL_CALIBRATION
+// Collect 18 distinct orientations; no fixed face/edge template is enforced.
 #define CALIB_TARGET_SAMPLES 18
 // Orientation difference threshold (cosine value).
 // cos(25 degrees) ≈ 0.90. If dot product > 0.90, the angle between two directions is less than 25 degrees, considered
@@ -314,13 +319,20 @@ typedef struct {
 	float x, y, z;
 } Vector3;
 
-int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
+int sensor_calibration_collect_accel_poses(float a_inv[][3], int *captured_count_out)
 {
 	const uint16_t op = sensor_calibration_current_operation();
+	const struct led_token feedback = sensor_calibration_current_feedback();
 	int64_t last_motion_event = -1000;
 	float rawData[3];
 	float pre_acc[3] = {0};
-	int resttime = 0;
+	struct accel_rest_state rest_state = {0};
+	struct sensor_accel_observation observation;
+	float rate = sensor_get_accel_odr() / CONFIG_SENSOR_ACCEL_OVERSAMPLING;
+	/* Allow three output periods and two polling intervals, up to the existing wait timeout. */
+	uint32_t max_gap_ms = isfinite(rate) && rate > 0.0f
+		? (uint32_t)fminf(1000.0f, fmaxf(100.0f, 40.0f + ceilf(3000.0f / rate)))
+		: 1000U;
 
 	Vector3 captured_dirs[CALIB_TARGET_SAMPLES];
 	int captured_count = 0;
@@ -333,7 +345,7 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 
 	magneto_reset();
 
-	LOG_INF("Starting Multi-Position Calibration (Target: %d poses)", CALIB_TARGET_SAMPLES);
+	LOG_INF("Starting accelerometer calibration (Target: %d orientations)", CALIB_TARGET_SAMPLES);
 	LOG_INF("Please rotate device to random orientations and hold still.");
 
 	// Main loop: until target number of samples collected
@@ -342,7 +354,7 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 		cal_event_step(op, CAL_PHASE_WAIT_POSE, captured_count + 1);
 		tracker_events_notify();
 		// 1. Wait for device to be stationary
-		set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_SENSOR); // Indicate searching for stationary state
+		sensor_calibration_stage(feedback, LED_WAIT_MOVE);
 		bool pose_timeout = false;
 		while (1) {
 			/* Feed watchdog during user interaction wait */
@@ -355,14 +367,15 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 				break;
 			}
 
-			if (sensor_wait_accel(rawData, K_MSEC(1000))) {
+			if (sensor_wait_accel_observation(&observation, K_MSEC(1000))) {
 				cal_event_end(op, CAL_OUTCOME_FAILED, CAL_PHASE_WAIT_POSE, CAL_REASON_SAMPLE_TIMEOUT);
 				tracker_events_notify();
 				return -2; // Timeout, magneto state not handled here
 			}
 
-			int rest = isAccRest(rawData, pre_acc, THRESHOLD_ACC, &resttime, 100);
-			memcpy(pre_acc, rawData, sizeof(rawData)); // Update previous data
+			int rest = isAccRest(&observation, k_uptime_get_32(), max_gap_ms, THRESHOLD_ACC, &rest_state);
+			memcpy(rawData, observation.v, sizeof(rawData));
+			memcpy(pre_acc, rawData, sizeof(rawData));
 
 			if (rest == 1) {
 				// Device is stationary, now check if this pose is new
@@ -406,11 +419,10 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 					captured_dirs[captured_count].y = curr_dir_y;
 					captured_dirs[captured_count].z = curr_dir_z;
 					break;
-				} else {
-					// Duplicate pose detected, briefly flash LED to prompt user to change orientation, but do not error
-					set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);
-					k_msleep(100); // Debounce slightly
 				}
+				// Repeated orientations are normal attempts, not failures.
+				sensor_calibration_stage(feedback, LED_WAIT_MOVE);
+				k_msleep(100); // Debounce slightly
 			}
 			k_msleep(20);
 		}
@@ -427,10 +439,22 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 		// Reset timeout counter when a new valid pose is found
 		last_new_pose_time = k_uptime_get();
 
+		/* Only the calibration worker collects poses. Keep rollback storage
+		 * off its stack while preserving accepted-sample addition order. */
+		static struct {
+			double ata[100];
+			double norm_sum;
+			double sample_count;
+		} committed;
+		memcpy(committed.ata, mag_cal_workspace.ata, sizeof(committed.ata));
+		committed.norm_sum = norm_sum;
+		committed.sample_count = sample_count;
+
 		LOG_INF("Capturing pose %d/%d...", captured_count + 1, CALIB_TARGET_SAMPLES);
 		cal_event_step(op, CAL_PHASE_CAPTURE_POSE, captured_count + 1);
 		tracker_events_notify();
-		set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_SENSOR);
+		sensor_calibration_stage(feedback, LED_COLLECT_STILL);
+		sensor_discard_pending_accel();
 
 		int sample_idx = 0;
 		while (sample_idx < SAMPLES_PER_ORIENTATION) {
@@ -465,13 +489,19 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 		}
 
 		if (sample_idx == -1) {
+			memcpy(mag_cal_workspace.ata, committed.ata, sizeof(committed.ata));
+			norm_sum = committed.norm_sum;
+			sample_count = committed.sample_count;
+			rest_state.initialized = false;
 			continue;
 		}
 
 		captured_count++;
+		rest_state.initialized = false;
 		cal_event_step(op, CAL_PHASE_POSE_DONE, captured_count);
 		tracker_events_notify();
-		set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
+		sensor_calibration_result(feedback, LED_STAGE_ACK);
+		sensor_calibration_stage(feedback, LED_WAIT_MOVE);
 		LOG_INF("Pose %d saved!", captured_count);
 
 		k_msleep(500);
@@ -483,6 +513,7 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 
 	LOG_INF("Calculating calibration matrix...");
 	cal_event_step(op, CAL_PHASE_FIT, 0);
+	sensor_calibration_stage(feedback, LED_PROCESSING);
 	tracker_events_notify();
 
 	wait_for_threads();
@@ -500,14 +531,12 @@ int sensor_6_sideBias(float a_inv[][3], int *captured_count_out)
 }
 #endif
 
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 // Collect magnetometer sample for manual calibration.
 // Accumulates into ATA and periodically runs trial calibration for quality check.
-static void sensor_sample_mag_magneto_sample(const float m[3])
+static void sensor_sample_mag_magneto_sample(const float m[3], float m_inv[4][3])
 {
-	// Direction diversity gate: accept sample if either mag direction OR
-	// accelerometer (gravity) direction has changed since last accepted.
-	// Identical logic to the online path — breaks direction lock-in during
-	// magnetic interference by cross-validating with physical orientation.
+	// Manual collection accepts magnetic or trustworthy gravity direction changes.
 	//
 	// Gate accelerometer by magnitude as well: skip the direction check
 	// entirely when the device is under strong linear acceleration, falling
@@ -573,17 +602,14 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 		manual_last_accel_dir[2] = cur_accel_dir[2];
 	}
 
-	// Accept sample — accumulate into chunked-averaging buffer.
-	// Direction gate and center estimator still use the individual sample
-	// (above) so diversity tracking stays sensitive. Only the LS feed is
-	// averaged to suppress the n^2 noise bias in the ATA matrix.
+	// Accept sample - accumulate into the chunked-averaging buffer.
 	mag_cal_avg_buf[mag_cal_avg_count][0] = m[0];
 	mag_cal_avg_buf[mag_cal_avg_count][1] = m[1];
 	mag_cal_avg_buf[mag_cal_avg_count][2] = m[2];
 	mag_cal_avg_count++;
 
 	if (mag_cal_avg_count < mag_cal_avg_target) {
-		return; /* buffer not full yet */
+		return; // buffer not full yet
 	}
 
 	float avg[3] = {0, 0, 0};
@@ -603,24 +629,6 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 	magneto_coverage_sample(&manual_center_estimator, raw_mag, coverage_mag);
 	magneto_update_dir_range(coverage_mag);
 
-	/* LED coverage gradient (red→amber→green) */
-	{
-		float dir_range = magneto_min_dir_range();
-		float raw_range = magneto_center_min_range(&manual_center_estimator);
-		float dir_cov = dir_range / MAG_CAL_MIN_DIR_RANGE;
-		float raw_cov = raw_range / MAG_CAL_MIN_RAW_AXIS_RANGE;
-		float range_cov = (dir_cov < raw_cov) ? dir_cov : raw_cov;
-		float sample_cov = (float)sample_count / (float)MAG_CAL_MIN_SAMPLES;
-		float cov = (range_cov < sample_cov) ? range_cov : sample_cov;
-		if (cov > 1.0f) {
-			cov = 1.0f;
-		}
-		if (cov < 0.0f) {
-			cov = 0.0f;
-		}
-		mag_cal_coverage = cov;
-	}
-
 	// Attempt trial calibration every MAG_CAL_TRIAL_INTERVAL samples
 	if (sample_count >= MAG_CAL_MIN_SAMPLES && (int)sample_count % MAG_CAL_TRIAL_INTERVAL < 1) {
 		float min_range = magneto_min_dir_range();
@@ -633,9 +641,10 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 			(double)raw_range,
 			(double)MAG_CAL_MIN_RAW_AXIS_RANGE
 		);
-		// Which axis is short is what the operator has to act on: both gates
-		// take the minimum across axes, so one under-covered axis stalls the
-		// whole calibration no matter how long the tracker is turned.
+
+		// Which axis is short is what the operator has to act on: both gates take
+		// the minimum across axes, so one under-covered axis stalls the whole
+		// calibration no matter how long the tracker is turned.
 		float raw_spans[3];
 		magneto_center_axis_spans(&manual_center_estimator, raw_spans);
 		LOG_INF(
@@ -653,18 +662,18 @@ static void sensor_sample_mag_magneto_sample(const float m[3])
 		// Require minimum directional coverage before attempting calibration
 		if (min_range < MAG_CAL_MIN_DIR_RANGE || raw_range < MAG_CAL_MIN_RAW_AXIS_RANGE) {
 			LOG_INF("Mag cal: need more rotation, keep turning");
-			set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 			return;
 		}
 
-		if (magneto_quality_check(
-			mag_cal_workspace.ata, norm_sum, sample_count, MAG_CAL_MIN_SAMPLES, NULL
-		)) {			magneto_progress |= 0b01111111;
+		if (magneto_quality_check(mag_cal_workspace.ata, norm_sum, sample_count, MAG_CAL_MIN_SAMPLES, m_inv)) {
+			magneto_progress |= 0b01111111;
 			LOG_INF("Mag cal ready: %d samples, min_range=%.2f", (int)sample_count, (double)min_range);
-			set_led(SYS_LED_PATTERN_FLASH, SYS_LED_PRIORITY_SENSOR);
+			struct led_token feedback = sensor_calibration_current_feedback();
+			sensor_calibration_result(feedback, LED_STAGE_ACK);
+			sensor_calibration_stage(feedback, LED_PROCESSING);
 		} else {
 			LOG_INF("Mag cal: not ready yet, keep rotating (%d samples)", (int)sample_count);
-			set_led(SYS_LED_PATTERN_ONESHOT_PROGRESS, SYS_LED_PRIORITY_SENSOR);
 		}
 	}
 }
+#endif

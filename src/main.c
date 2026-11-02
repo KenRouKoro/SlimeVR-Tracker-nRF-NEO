@@ -30,6 +30,8 @@
 #include "connection/esb.h"
 #include "sensor/sensor.h"
 
+#include <stdint.h>
+
 #include <zephyr/sys/reboot.h>
 #include <zephyr/drivers/gpio.h>
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
@@ -76,7 +78,8 @@ int main(void)
 #endif
 #endif
 
-	set_led(SYS_LED_PATTERN_ON, SYS_LED_PRIORITY_BOOT); // Boot LED
+	/* Boot is not a new button input. Initialization/link/readiness owners
+	 * publish their real states without an extra startup ACK color change. */
 
 	uint8_t reboot_counter = reboot_counter_read();
 	bool booting_from_shutdown
@@ -84,9 +87,6 @@ int main(void)
 
 	if (button_read()) {
 		while (button_read()) {
-			if (system_uptime_since_boot_ms() > 1000) {
-				set_led(SYS_LED_PATTERN_LONG, SYS_LED_PRIORITY_HIGHEST);
-			}
 			if (system_uptime_since_boot_ms() > 5000) {
 #if CONFIG_USER_EXTRA_ACTIONS
 				LOG_INF("Button long hold timeout, continuing boot");
@@ -98,25 +98,16 @@ int main(void)
 			}
 			k_msleep(1);
 		}
-		if (system_uptime_since_boot_ms() <= 5000) {
-			set_led(SYS_LED_PATTERN_ONESHOT_POWERON, SYS_LED_PRIORITY_HIGHEST);
-		} else {
-			set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_HIGHEST);
-		}
-	} else if (booting_from_shutdown) {
-		set_led(SYS_LED_PATTERN_ONESHOT_POWERON, SYS_LED_PRIORITY_BOOT);
 	}
 
 	bool docked = dock_read();
-
-	uint8_t reset_mode = -1;
 
 	if (reboot_counter == 0) {
 		reboot_counter = 100;
 	} else if (reboot_counter > 200) {
 		reboot_counter = 200; // How did you get here
 	}
-	reset_mode = reboot_counter - 100;
+	uint8_t reset_mode = reboot_counter - 100;
 	if (reset_pin_reset && !docked) // Count pin resets while not docked
 	{
 		reboot_counter++;
@@ -132,13 +123,20 @@ int main(void)
 	if (!reset_pin_reset
 		&& reset_mode
 			   == 0) { // Only need to check once, if the button is pressed again an interrupt is triggered from before
-		reset_mode = -1; // Cancel reset_mode (shutdown)
+		const uint8_t reset_mode_cancelled = UINT8_MAX;
+		reset_mode = reset_mode_cancelled;
 	}
 
 #if USER_SHUTDOWN_ENABLED
+#if DT_NODE_HAS_PROP(DT_PATH(zephyr_user), stat_gpios)
+	bool charging = false, charged = false;
+	(void)sys_charger_snapshot(&charging, &charged);
+#else
 	bool charging = chg_read();
 	bool charged = stby_read();
-	bool plugged = vin_read();
+#endif
+	/* STAT high-Z does not establish external-power absence. */
+	bool plugged = vin_read() || vbus_read();
 
 	if (reset_mode == 0 && !booting_from_shutdown && !charging && !charged
 		&& !plugged) { // Reset mode user shutdown, only if unplugged and undocked
@@ -146,9 +144,8 @@ int main(void)
 	}
 #endif
 
-	if (!booting_from_shutdown) { // ONESHOT_POWERON automatically sets LED off
+	if (!booting_from_shutdown) {
 		k_usleep(60);
-		set_led(SYS_LED_PATTERN_OFF, SYS_LED_PRIORITY_BOOT);
 	}
 
 	sys_reset_mode(reset_mode);

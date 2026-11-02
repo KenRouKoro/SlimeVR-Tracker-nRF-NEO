@@ -10,12 +10,7 @@ CONFIG_SLIMEVR_USB_DEVICE_PRODUCT="FoxSnackLiteV3 LSM6DSV Tracker"
 CONFIG_BATTERY_USE_REG_BUCK_MAPPING=y
 CONFIG_IGNORE_CHARGE_WAKE_ON_VBUS=y
 
-# vcc-gpios (P1.02) is the enable pin of the external sensor-rail LDO, not a
-# switched rail: System OFF must drive it low instead of releasing it (Hi-Z),
-# otherwise the EN floats and the rail can stay powered.
-CONFIG_VCC_GPIO_IS_ENABLE=y
-
-# Sensor driver whitelist (BOM: LSM6DSV/ICM45686 + MMC5603/MMC5983/QMC6309/QMC5883)
+# Upstream BOM: SPI LSM6DSV/ICM45686 and I2C MMC5603/MMC5983/QMC6309/QMC5883.
 CONFIG_SENSOR_IMU_DRIVERS_MINIMAL=y
 CONFIG_SENSOR_DRV_LSM6DSV=y
 CONFIG_SENSOR_DRV_ICM45686=y
@@ -25,5 +20,5 @@ CONFIG_SENSOR_DRV_MMC5983MA=y
 CONFIG_SENSOR_DRV_QMC6309=y
 CONFIG_SENSOR_DRV_QMC5883L=y
 
-#generate for adafruit uf2 bootloader flashing
+# Adafruit UF2 bootloader; sysbuild selects the shared nRF52840 UF2 partitions.
 CONFIG_BUILD_OUTPUT_UF2=y

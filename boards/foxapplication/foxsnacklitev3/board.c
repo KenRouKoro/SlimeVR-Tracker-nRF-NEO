@@ -9,21 +9,20 @@
 #include <zephyr/devicetree.h>
 
 #define ZEPHYR_USER_NODE DT_PATH(zephyr_user)
-
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
-#define VCC_GPIO_PIN DT_GPIO_PIN(ZEPHYR_USER_NODE, vcc_gpios)
-#define VCC_GPIO_PORT_NUM DT_PROP(DT_GPIO_CTLR(ZEPHYR_USER_NODE, vcc_gpios), port)
-#endif
+#define SENSOR_POWER_PIN \
+	NRF_GPIO_PIN_MAP(DT_PROP(DT_GPIO_CTLR(ZEPHYR_USER_NODE, pwr_gpios), port), \
+		DT_GPIO_PIN(ZEPHYR_USER_NODE, pwr_gpios))
 
 static int board_foxsnacklitev3_init(void)
 {
-#if DT_NODE_HAS_PROP(ZEPHYR_USER_NODE, vcc_gpios)
-	/* vcc-gpios = external sensor-rail LDO enable (active high). Push-pull, not
-	 * open source: power.c drives it inactive (low) for System OFF, which an
-	 * open-source pad (D0H1) could only release, leaving the EN floating. */
-	nrf_gpio_cfg(NRF_GPIO_PIN_MAP(VCC_GPIO_PORT_NUM, VCC_GPIO_PIN), NRF_GPIO_PIN_DIR_OUTPUT, NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL, NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
-	nrf_gpio_pin_set(NRF_GPIO_PIN_MAP(VCC_GPIO_PORT_NUM, VCC_GPIO_PIN));
-#endif
+	/* P1.02 is an LDO enable, not the sensor supply itself. Preload high
+	 * before enabling the output; System OFF later drives it low through
+	 * the application's pwr-gpios lifecycle. WoM must retain sensor power.
+	 */
+	nrf_gpio_pin_set(SENSOR_POWER_PIN);
+	nrf_gpio_cfg(SENSOR_POWER_PIN, NRF_GPIO_PIN_DIR_OUTPUT,
+		NRF_GPIO_PIN_INPUT_DISCONNECT, NRF_GPIO_PIN_NOPULL,
+		NRF_GPIO_PIN_S0S1, NRF_GPIO_PIN_NOSENSE);
 	return 0;
 }
 

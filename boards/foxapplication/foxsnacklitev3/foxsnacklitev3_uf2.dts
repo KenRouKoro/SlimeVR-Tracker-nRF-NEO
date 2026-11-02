@@ -1,27 +1,26 @@
 // Copyright (c) 2024 Nordic Semiconductor ASA
 // SPDX-License-Identifier: Apache-2.0
+// Pinout: KenRouKoro/SlimeVR-Tracker-nRF-NEO@ff69db964bf7d78ae217896f33e7588f8f7e9af4
 
 /dts-v1/;
 #include <nordic/nrf52840_qiaa.dtsi>
 
-//move to dtsi?
 &pinctrl {
-
 	pwm0_default: pwm0_default {
 		group1 {
 			psels = <NRF_PSEL(PWM_OUT0, 0, 12)>, // Red
-					<NRF_PSEL(PWM_OUT1, 0, 8)>, // Green
-					<NRF_PSEL(PWM_OUT2, 1, 9)>; // Blue
+				<NRF_PSEL(PWM_OUT1, 0, 8)>, // Green
+				<NRF_PSEL(PWM_OUT2, 1, 9)>; // Blue
 			nordic,drive-mode = <NRF_DRIVE_D0S1>;
-			nordic,invert;
+			/* Common cathode: active high, initially low/off. */
 		};
 	};
 
 	pwm0_sleep: pwm0_sleep {
 		group1 {
-			psels = <NRF_PSEL(PWM_OUT0, 0, 12)>, // Red
-					<NRF_PSEL(PWM_OUT1, 0, 8)>, // Green
-					<NRF_PSEL(PWM_OUT2, 1, 9)>; // Blue
+			psels = <NRF_PSEL(PWM_OUT0, 0, 12)>,
+				<NRF_PSEL(PWM_OUT1, 0, 8)>,
+				<NRF_PSEL(PWM_OUT2, 1, 9)>;
 			low-power-enable;
 		};
 	};
@@ -29,52 +28,43 @@
 	spi3_default: spi3_default {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 20)>,
-					<NRF_PSEL(SPIM_MOSI, 0, 22)>,
-					<NRF_PSEL(SPIM_SCK, 0, 24)>;
+				<NRF_PSEL(SPIM_MOSI, 0, 22)>,
+				<NRF_PSEL(SPIM_SCK, 0, 24)>;
 		};
 	};
 
 	spi3_sleep: spi3_sleep {
 		group1 {
 			psels = <NRF_PSEL(SPIM_MISO, 0, 20)>,
-					<NRF_PSEL(SPIM_MOSI, 0, 22)>,
-					<NRF_PSEL(SPIM_SCK, 0, 24)>;
+				<NRF_PSEL(SPIM_MOSI, 0, 22)>,
+				<NRF_PSEL(SPIM_SCK, 0, 24)>;
 			low-power-enable;
 		};
 	};
 
-	/*
-	 * rev3 hardware has no external I2C pull-ups, and nrfx TWIM is
-	 * initialized with skip_gpio_cfg (see i2c_nrfx_twim.c), so this
-	 * internal pull-up is the only one on the bus. Do not remove.
-	 */
+	/* Rev3 has no external I2C pull-ups. These are required on the mag bus. */
 	i2c0_default: i2c0_default {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 15)>,
-					<NRF_PSEL(TWIM_SCL, 0, 13)>;
+				<NRF_PSEL(TWIM_SCL, 0, 13)>;
 			bias-pull-up;
 		};
 	};
 
-	/*
-	 * Sleep keeps both pins unpulled: the sensor rail is switched off
-	 * (vcc-gpios) before suspend, and a pull-up would push current into
-	 * the unpowered sensors through their ESD diodes.
-	 */
+	/* Do not back-power sensors through SDA/SCL when their LDO is off. */
 	i2c0_sleep: i2c0_sleep {
 		group1 {
 			psels = <NRF_PSEL(TWIM_SDA, 0, 15)>,
-					<NRF_PSEL(TWIM_SCL, 0, 13)>;
+				<NRF_PSEL(TWIM_SCL, 0, 13)>;
 			bias-disable;
 			low-power-enable;
 		};
 	};
 };
-//end
 
 / {
-	model = "foxsnacklitev3_uf2";
-	compatible = "foxsnacklitev3_uf2";
+	model = "FoxApplication FoxSnackLiteV3 Tracker";
+	compatible = "foxapplication,foxsnacklitev3-uf2";
 
 	chosen {
 		zephyr,sram = &sram0;
@@ -95,6 +85,7 @@
 			pwms = <&pwm0 2 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
 		};
 	};
+
 	leds {
 		compatible = "gpio-leds";
 		led0: led_0 {
@@ -129,25 +120,27 @@
 	battery-divider {
 		compatible = "voltage-divider";
 		status = "okay";
-		io-channels = <&adc 12>; // Measure VDDHDIV5
+		io-channels = <&adc 12>; // VDDH/5
 		output-ohms = <1>;
 		full-ohms = <5>;
 	};
 
 	zephyr,user {
-		int0-gpios = <&gpio0 17 0>;
-		led0-gpios = <&gpio0 12 (GPIO_OPEN_SOURCE)>;
-		led1-gpios = <&gpio0 8 (GPIO_OPEN_SOURCE)>;
-		led2-gpios = <&gpio1 9 (GPIO_OPEN_SOURCE)>;
+		led-capability = "rgb-pwm";
+		pwms = <&pwm0 0 PWM_MSEC(1) PWM_POLARITY_NORMAL>,
+			<&pwm0 1 PWM_MSEC(1) PWM_POLARITY_NORMAL>,
+			<&pwm0 2 PWM_MSEC(1) PWM_POLARITY_NORMAL>;
+		led-channel-colors = <1 2 3>;
+		led-channel-weights = <10000 10000 10000>;
+		led-primary-channel = <1>;
+		int0-gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
 		chg-gpios = <&gpio0 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 		stby-gpios = <&gpio1 4 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		/* External sensor-rail LDO enable (active high). Driven high by board.c
-		 * at boot and kept high in WOM sleep (the IMU must stay powered to
-		 * wake the SoC); System OFF drives it low instead of releasing it —
-		 * see CONFIG_VCC_GPIO_IS_ENABLE in the board defconfig. */
-		vcc-gpios = <&gpio1 2 0>;
+		/* Sensor LDO EN: local pwr-gpios keeps it high during WoM and
+		 * drives it low for user shutdown, rather than floating the EN.
+		 */
+		pwr-gpios = <&gpio1 2 GPIO_ACTIVE_HIGH>;
 	};
-
 };
 
 &reg0 {
@@ -201,13 +194,7 @@ zephyr_udc0: &usbd {
 	status = "disabled";
 };
 
-/*
- * chg-gpios sits on P0.09, which is an NFCT antenna pin by default
- * (UICR.NFCPINS reset value is 0xFFFFFFFF = NFC protected). Without this
- * the charge-status input and its wake sense are dead on a chip whose UICR
- * was not already patched by the UF2 bootloader. nrfx clears UICR.NFCPINS
- * and resets once, on the first boot.
- */
+/* P0.09 is the charge-status input, not an NFC antenna connection. */
 &uicr {
 	nfct-pins-as-gpios;
 };
@@ -219,7 +206,7 @@ zephyr_udc0: &usbd {
 	pinctrl-0 = <&spi3_default>;
 	pinctrl-1 = <&spi3_sleep>;
 	pinctrl-names = "default", "sleep";
-	clock-frequency = < DT_FREQ_M(10) >;
+	clock-frequency = <DT_FREQ_M(10)>;
 	cs-gpios = <&gpio1 0 GPIO_ACTIVE_LOW>;
 
 	imu_spi: imu_spi@0 {

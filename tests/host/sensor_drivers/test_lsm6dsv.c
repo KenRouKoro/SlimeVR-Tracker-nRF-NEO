@@ -16,13 +16,19 @@
 enum { ENDOP = 0x01, NACK = 0x08, WRITE_DONE = 0x80, MASTER_ON = 0x04 };
 enum operation { READ, WRITE };
 static struct {
-	uint8_t main[256], hub[256], external[256], status;
-	bool bank, master, stalled, no_xlda, clear_status, wrote, reset_stuck;
+	uint8_t registers[256], hub[256], external[256], status;
+	bool bank, master, stalled, no_trigger, clear_status, wrote, reset_stuck;
 	bool late_nack;
+	bool dummy_prefix, partial_read_error;
+	unsigned slot_reads; /* Slots of the most recent read epoch. */
+	uint8_t slot_sub[4], slot_len[4], last_master;
+	unsigned sleep_count;
+	uint32_t sleeps_us[1024];
 	uint8_t error;
 	uint64_t now, next_op;
 	uint32_t latency;
 	unsigned starts, writes, data_reads, status_reads;
+	unsigned transactions, fail_transaction;
 	const sensor_ext_ssi_t *ext;
 	struct {
 		bool armed, bank, any_bank, applied_write;
@@ -32,11 +38,13 @@ static struct {
 		unsigned skip;
 	} fault;
 } hw;
+static unsigned gyro_discontinuities;
+void sensor_gyro_report_discontinuity(void) { gyro_discontinuities++; }
 
 static void advance(uint64_t us)
 {
 	hw.now += us;
-	if (!hw.master || hw.stalled || hw.no_xlda || hw.now < hw.next_op)
+	if (!hw.master || hw.stalled || hw.no_trigger || hw.now < hw.next_op)
 		return;
 	bool reading = hw.hub[LSM6DSV_SLV0_ADD] & 1;
 	if (!reading && hw.wrote && (hw.hub[LSM6DSV_MASTER_CONFIG] & 0x40))
@@ -45,9 +53,23 @@ static void advance(uint64_t us)
 	if (!hw.error) {
 		uint8_t sub = hw.hub[LSM6DSV_SLV0_SUBADD];
 		if (reading) {
-			unsigned len = hw.hub[LSM6DSV_SLV0_CONFIG] & 7;
-			for (unsigned i = 0; i < len; i++)
-				hw.hub[LSM6DSV_SENSOR_HUB_1 + i] = hw.external[(uint8_t)(sub + i)];
+			unsigned offset = 0;
+			unsigned slots = (hw.hub[LSM6DSV_MASTER_CONFIG] & 3) + 1;
+			hw.slot_reads = 0;
+			for (unsigned slot = 0; slot < slots; slot++) {
+				unsigned base = LSM6DSV_SLV0_ADD + 3 * slot;
+				unsigned len = hw.hub[base + 2] & 7;
+				sub = hw.hub[base + 1];
+				assert(len && offset + len <= 18);
+				hw.slot_sub[hw.slot_reads] = sub;
+				hw.slot_len[hw.slot_reads++] = len;
+				for (unsigned i = 0; i < len; i++) {
+					uint8_t value = hw.dummy_prefix
+						? (i < 2 ? 0xee : hw.external[(uint8_t)(sub + i - 2)])
+						: hw.external[(uint8_t)(sub + i)];
+					hw.hub[LSM6DSV_SENSOR_HUB_1 + offset++] = value;
+				}
+			}
 		} else {
 			hw.external[sub] = hw.hub[LSM6DSV_DATAWRITE_SLV0];
 			hw.writes++;
@@ -59,11 +81,19 @@ static void advance(uint64_t us)
 int64_t host_k_uptime_get(void) { return hw.now / 1000; }
 void host_k_busy_wait(uint32_t us) { advance(us); }
 void host_k_msleep(int32_t ms) { assert(ms >= 0); advance((uint64_t)ms * 1000); }
-void host_k_usleep(int32_t us) { assert(us >= 0); advance(us); }
+void host_k_usleep(int32_t us)
+{
+	assert(us >= 0);
+	if (hw.sleep_count < ARRAY_SIZE(hw.sleeps_us))
+		hw.sleeps_us[hw.sleep_count++] = us;
+	advance(us);
+}
 
 static int transfer(enum operation op, uint8_t reg, int value)
 {
 	advance(hw.latency);
+	if (++hw.transactions == hw.fail_transaction)
+		return -ENXIO;
 	if (hw.fault.armed && hw.fault.op == op && hw.fault.reg == reg &&
 		(hw.fault.any_bank || hw.fault.bank == hw.bank) &&
 		(hw.fault.value < 0 || hw.fault.value == value)) {
@@ -90,7 +120,7 @@ int ssi_burst_write(enum sensor_interface_dev dev, uint8_t reg, const uint8_t *b
 	}
 	/* SENSOR_HUB output registers are read-only, including CTRL3's alias. */
 	assert(!hw.bank || reg < LSM6DSV_SENSOR_HUB_1 || reg >= LSM6DSV_MASTER_CONFIG);
-	memcpy((hw.bank ? hw.hub : hw.main) + reg, buf, len);
+	memcpy((hw.bank ? hw.hub : hw.registers) + reg, buf, len);
 	if (hw.bank && reg == LSM6DSV_MASTER_CONFIG) {
 		if (buf[0] & 0x80) {
 			if (!hw.reset_stuck)
@@ -103,14 +133,15 @@ int ssi_burst_write(enum sensor_interface_dev dev, uint8_t reg, const uint8_t *b
 			hw.status |= NACK;
 		hw.master = (buf[0] & MASTER_ON) != 0;
 		if (hw.master) {
+			hw.last_master = buf[0];
 			hw.starts++;
 			hw.wrote = false;
 			hw.next_op = hw.now + 4200;
 		}
 	} else if (!hw.bank && reg == LSM6DSV_CTRL3 && (buf[0] & 1)) {
-		memset(hw.main, 0, sizeof(hw.main));
+		memset(hw.registers, 0, sizeof(hw.registers));
 		memset(hw.hub, 0, sizeof(hw.hub));
-		hw.main[LSM6DSV_WHO_AM_I] = 0x70;
+		hw.registers[LSM6DSV_WHO_AM_I] = 0x70;
 		hw.master = false;
 		hw.status = 0;
 	}
@@ -126,8 +157,11 @@ int ssi_burst_read(enum sensor_interface_dev dev, uint8_t reg, uint8_t *buf, uin
 {
 	assert(dev == SENSOR_INTERFACE_DEV_IMU && len && (unsigned)reg + len <= 256);
 	int err = transfer(READ, reg, -1);
-	if (err)
+	if (err) {
+		if (hw.partial_read_error && hw.bank && reg == LSM6DSV_SENSOR_HUB_1)
+			buf[0] = hw.hub[reg];
 		return err;
+	}
 	if ((hw.bank && reg == LSM6DSV_STATUS_MASTER) ||
 		(!hw.bank && reg == LSM6DSV_STATUS_MASTER_MAINPAGE)) {
 		assert(len == 1);
@@ -135,13 +169,10 @@ int ssi_burst_read(enum sensor_interface_dev dev, uint8_t reg, uint8_t *buf, uin
 		*buf = hw.status;
 		if (hw.clear_status)
 			hw.status = 0;
-	} else if (!hw.bank && reg == LSM6DSV_STATUS_REG) {
-		assert(len == 1);
-		*buf = hw.no_xlda ? 0 : 1;
 	} else {
 		if (hw.bank && reg == LSM6DSV_SENSOR_HUB_1)
 			hw.data_reads++;
-		memcpy(buf, (hw.bank ? hw.hub : hw.main) + reg, len);
+		memcpy(buf, (hw.bank ? hw.hub : hw.registers) + reg, len);
 	}
 	return 0;
 }
@@ -175,11 +206,12 @@ static void reset_model(bool prefetch, bool clear_status)
 	memset(&hw, 0, sizeof(hw));
 	hw.latency = 100;
 	hw.clear_status = clear_status;
-	hw.main[LSM6DSV_WHO_AM_I] = 0x70;
+	hw.registers[LSM6DSV_WHO_AM_I] = 0x70;
 	assert(lsm_ext_setup(SENSOR_EXT_MODE_I2CM_PROXY) == 0);
 	assert(hw.ext->ext_set_prefetch(prefetch) == 0);
 	initialize();
-	for (unsigned i = 0; i < 7; i++)
+	gyro_discontinuities = 0;
+	for (unsigned i = 0; i < 18; i++)
 		hw.external[0x08 + i] = 0x50 + i;
 }
 static int sample(uint8_t *out)
@@ -222,12 +254,12 @@ static void test_configuration_failfast(void)
 	for (unsigned writing = 0; writing < 2; writing++) {
 		reset_model(false, false);
 		uint8_t controls[3];
-		memcpy(controls, hw.main + LSM6DSV_CTRL6, sizeof(controls));
+		memcpy(controls, hw.registers + LSM6DSV_CTRL6, sizeof(controls));
 		/* First select belongs to stop, second to profile configuration. */
 		fail_on(WRITE, false, LSM6DSV_FUNC_CFG_ACCESS, 0x40, 1);
 		int err = writing ? hw.ext->ext_write(0x1e, command, 2) : sample(out);
 		assert(err == -ENXIO && !hw.fault.armed);
-		assert(memcmp(controls, hw.main + LSM6DSV_CTRL6, sizeof(controls)) == 0);
+		assert(memcmp(controls, hw.registers + LSM6DSV_CTRL6, sizeof(controls)) == 0);
 		assert(hw.starts == 0 && !hw.master && !hw.bank);
 
 		reset_model(false, false);
@@ -296,13 +328,19 @@ static void test_error_during_stop(void)
 static void test_pending_status_io_failure(void)
 {
 	uint8_t out[7];
-	reset_model(true, true);
-	expect_sample(out);
-	fail_on(READ, true, LSM6DSV_STATUS_MASTER, -1, 0);
-	assert(sample(out) == -ENXIO && !hw.fault.armed);
-	assert(!hw.master && !hw.bank);
-	memset(hw.external + 0x08, 0x24, 7);
-	expect_sample(out);
+	for (unsigned stopped = 0; stopped < 2; stopped++) {
+		reset_model(true, true);
+		expect_sample(out);
+		/* Probe the armed epoch from the main page, then recheck after stopping. */
+		if (stopped)
+			fail_on(READ, true, LSM6DSV_STATUS_MASTER, -1, 0);
+		else
+			fail_on(READ, false, LSM6DSV_STATUS_MASTER_MAINPAGE, -1, 0);
+		assert(sample(out) == -ENXIO && !hw.fault.armed);
+		assert(!hw.master && !hw.bank);
+		memset(hw.external + 0x08, 0x24, 7);
+		expect_sample(out);
+	}
 }
 
 static void test_failed_read_invalidates(void)
@@ -322,23 +360,130 @@ static void test_deadlines_and_status_io(void)
 {
 	uint8_t out[7], command[] = {0x20, 0x73};
 	for (unsigned writing = 0; writing < 2; writing++) {
-		for (unsigned xlda = 0; xlda < 2; xlda++) {
+		for (unsigned latency = 0; latency < 2; latency++) {
 			reset_model(false, false);
-			hw.latency = 700; /* Deadlines must include host IO and scheduling. */
-			hw.no_xlda = xlda;
-			hw.stalled = true;
+			hw.latency = latency ? 700 : 100; /* Deadlines must include host IO and scheduling. */
+			hw.no_trigger = latency;
+			hw.stalled = !latency;
+			hw.status_reads = 0;
 			uint64_t start = hw.now;
 			int err = writing ? hw.ext->ext_write(0x1e, command, 2) : sample(out);
 			assert(err == -ETIMEDOUT);
 			assert(hw.now - start < 110000);
+			/* Polls yield the CPU between status reads. */
+			assert(hw.status_reads <= 100000 / (250 + hw.latency) + 8);
 			assert(!hw.master && !hw.bank && hw.data_reads == 0);
 		}
 		reset_model(false, false);
-		fail_on(READ, false, LSM6DSV_STATUS_REG, -1, 0);
+		/* Skip the armed-baseline read and fail the first completion poll. */
+		fail_on(READ, true, LSM6DSV_STATUS_MASTER, -1, 1);
 		int err = writing ? hw.ext->ext_write(0x1e, command, 2) : sample(out);
 		assert(err == -ENXIO && !hw.fault.armed);
 		assert(!hw.master && !hw.bank && hw.data_reads == 0);
 	}
+}
+
+static int read_frame(uint8_t reg, uint8_t dummy, uint8_t word, uint8_t *out, uint8_t len)
+{
+	return hw.ext->ext_read_frame(0x14, reg, dummy, word, out, len);
+}
+
+static void test_frame_layout_and_background_epochs(void)
+{
+	uint8_t out[9], expected[9];
+	reset_model(true, false);
+	assert(hw.ext->ext_free_running && hw.ext->ext_read_frame);
+	hw.dummy_prefix = true;
+	for (unsigned i = 0; i < 18; i++)
+		hw.external[0x31 + i] = 0x10 + i;
+
+	/* Each slot repeats the dummy prefix and carries whole 3-byte words. */
+	assert(read_frame(0x31, 2, 3, out, sizeof(out)) == 0);
+	assert(memcmp(out, hw.external + 0x31, sizeof(out)) == 0);
+	assert(hw.master && !hw.bank && hw.last_master == (0x44 | 2));
+	for (unsigned slot = 0; slot < 3; slot++) {
+		unsigned base = LSM6DSV_SLV0_ADD + slot * 3;
+		assert(hw.hub[base] == ((0x14 << 1) | 1));
+		assert(hw.hub[base + 1] == 0x31 + 3 * slot);
+		assert(hw.hub[base + 2] == ((slot == 0 ? 0xa0 : slot == 1 ? 0x10 : 0) | 5));
+	}
+
+	/* An incomplete background epoch is not waited for and stays armed. */
+	unsigned starts = hw.starts, transactions = hw.transactions;
+	memset(out, 0xa5, sizeof(out));
+	assert(read_frame(0x31, 2, 3, out, sizeof(out)) == -EAGAIN);
+	assert(hw.transactions == transactions + 1 && hw.starts == starts && hw.master);
+	for (unsigned i = 0; i < sizeof(out); i++)
+		assert(out[i] == 0xa5);
+
+	hw.external[0x31] = 0x7e;
+	advance(5000);
+	assert(hw.slot_reads == 3 && hw.slot_sub[2] == 0x37 && hw.slot_len[2] == 5);
+	memcpy(expected, hw.external + 0x31, sizeof(expected));
+	hw.external[0x31] = 0x7f; /* After the epoch: must not be observed. */
+	assert(read_frame(0x31, 2, 3, out, sizeof(out)) == 0);
+	assert(memcmp(out, expected, sizeof(out)) == 0);
+	assert(hw.starts == starts + 1 && hw.master);
+
+	hw.error = NACK << 1;
+	advance(5000);
+	assert(read_frame(0x31, 2, 3, out, sizeof(out)) == -EIO);
+	assert(!hw.master && !hw.bank);
+	hw.error = 0;
+
+	/* Oversized or malformed frames are rejected before any bus traffic. */
+	transactions = hw.transactions;
+	assert(read_frame(0x31, 2, 3, out, 13) == -E2BIG);
+	assert(read_frame(0x31, 0, 8, out, 8) == -E2BIG);
+	assert(read_frame(0x31, 7, 1, out, 1) == -EINVAL);
+	assert(read_frame(0x31, 0, 0, out, 1) == -EINVAL);
+	assert(hw.ext->ext_read_frame(0x80, 0x31, 0, 1, out, 1) == -EINVAL);
+	assert(hw.transactions == transactions);
+}
+
+static void test_frame_rearms_after_incidental_read(void)
+{
+	uint8_t frame[9], out[7];
+	reset_model(true, false);
+	assert(read_frame(0x08, 0, 1, frame, sizeof(frame)) == 0);
+	assert(memcmp(frame, hw.external + 0x08, sizeof(frame)) == 0);
+	assert(hw.last_master == 0x45 && hw.hub[LSM6DSV_SLV0_ADD + 5] == (0x10 | 2));
+
+	/* A different read (e.g. temperature) runs its own epoch, then restores the frame. */
+	expect_sample(out);
+	assert(hw.master && hw.last_master == 0x45);
+	assert(hw.hub[LSM6DSV_SLV0_ADD + 1] == 0x08 && hw.hub[LSM6DSV_SLV0_ADD + 2] == (0xa0 | 7));
+	unsigned starts = hw.starts;
+	hw.external[0x10] ^= 0xff;
+	advance(5000);
+	assert(read_frame(0x08, 0, 1, frame, sizeof(frame)) == 0);
+	assert(frame[8] == hw.external[0x10]);
+	assert(hw.starts == starts + 1);
+
+	/* Changing the prefetch policy forgets the frame. */
+	assert(hw.ext->ext_set_prefetch(true) == 0);
+	expect_sample(out);
+	assert(hw.last_master == 0x44 && hw.hub[LSM6DSV_SLV0_ADD + 2] == (0xa0 | 7));
+}
+
+static void test_stop_settles_only_running_slots(void)
+{
+	uint8_t out[9];
+	reset_model(false, false);
+	hw.sleep_count = 0;
+	assert(hw.ext->ext_write_read(0x1e, &(uint8_t){0x08}, 1, out, 9) == 0);
+	unsigned settles = 0;
+	for (unsigned i = 0; i < hw.sleep_count; i++) {
+		if (hw.sleeps_us[i] == 250)
+			continue;
+		assert(hw.sleeps_us[i] == 100 + 250 * 2);
+		settles++;
+	}
+	assert(settles == 1);
+	/* A stopped hub is not settled again. */
+	hw.sleep_count = 0;
+	assert(hw.ext->ext_set_prefetch(false) == 0);
+	assert(hw.sleep_count == 0);
 }
 
 static void test_prefetch_policy_lifecycle(void)
@@ -393,8 +538,148 @@ static void test_shutdown_after_stop_failure(void)
 	}
 }
 
+static void test_fifo_destructive_loss_notification(void)
+{
+	reset_model(false, false);
+	uint8_t record[7];
+	hw.registers[LSM6DSV_FIFO_STATUS1] = 1;
+	hw.registers[LSM6DSV_FIFO_STATUS2] = LSM6DSV_FIFO_OVR_LATCHED;
+	assert(lsm_fifo_read(record, sizeof(record)) == 0);
+	assert(gyro_discontinuities == 1);
+	/* A latched overrun is still loss if the current FIFO count is zero. */
+	hw.registers[LSM6DSV_FIFO_STATUS1] = 0;
+	assert(lsm_fifo_read(record, sizeof(record)) == 0);
+	assert(gyro_discontinuities == 2);
+	hw.registers[LSM6DSV_FIFO_STATUS1] = 1;
+	hw.registers[LSM6DSV_FIFO_STATUS2] = 0;
+	fail_on(READ, false, LSM6DSV_FIFO_DATA_OUT_TAG, -1, 0);
+	assert(lsm_fifo_read(record, sizeof(record)) == 0);
+	assert(gyro_discontinuities == 3);
+	fail_on(READ, false, LSM6DSV_FIFO_STATUS1, -1, 0);
+	assert(lsm_fifo_read(record, sizeof(record)) == 0);
+	assert(gyro_discontinuities == 3); /* Failed status alone has consumed nothing. */
+	hw.registers[LSM6DSV_FIFO_STATUS2] = LSM6DSV_FIFO_FULL_IA;
+	assert(lsm_fifo_read(record, sizeof(record)) == 1);
+	assert(gyro_discontinuities == 3);
+}
+
+static void test_wom_bus_failures(void)
+{
+	reset_model(false, false);
+	hw.transactions = 0;
+	assert(lsm_setup_WOM() != 0xFF);
+	unsigned transactions = hw.transactions;
+	assert(transactions > 3);
+	for (unsigned failure = 1; failure <= transactions; failure++) {
+		reset_model(false, false);
+		hw.transactions = 0;
+		hw.fail_transaction = failure;
+		assert(lsm_setup_WOM() == 0xFF);
+	}
+	printf("LSM6DSV WOM: %u individual bus failures rejected\n", transactions);
+}
+
+static void test_hp_minimum_rate(void)
+{
+	reset_model(false, false);
+	float accel, gyro;
+	assert(lsm_update_odr(1.0f, 1.0f, &accel, &gyro) == 0);
+	assert((hw.registers[LSM6DSV_CTRL1] & 0x0f) == ODR_7_5Hz);
+	assert((hw.registers[LSM6DSV_CTRL2] & 0x0f) == ODR_7_5Hz);
+	assert(accel == 1.0f / 7.5f && gyro == 1.0f / 7.5f);
+	assert(lsm_update_odr(0.0f, 0.0f, &accel, &gyro) == 0);
+	assert((hw.registers[LSM6DSV_CTRL1] & 0x0f) == ODR_OFF);
+	assert((hw.registers[LSM6DSV_CTRL2] & 0x0f) == ODR_OFF);
+}
+
+static void test_consecutive_unknown_tags(void)
+{
+	reset_model(false, false);
+	uint8_t unknown[7] = {0xf8}, valid[7] = {LSM6DSV_TAG_ACCEL_NC << 3};
+	float accel[3], gyro[3];
+	for (unsigned i = 0; i < 6; i++) {
+		assert(lsm_fifo_process(0, unknown, accel, gyro) == 1);
+		assert(lsm_fifo_process(0, valid, accel, gyro) == 0);
+	}
+	assert(gyro_discontinuities == 0);
+	for (unsigned i = 0; i < 4; i++) {
+		hw.registers[LSM6DSV_FIFO_STATUS1] = 1;
+		memcpy(hw.registers + LSM6DSV_FIFO_DATA_OUT_TAG, unknown, sizeof(unknown));
+		uint8_t batch[7];
+		assert(lsm_fifo_read(batch, sizeof(batch)) == 1);
+		assert(lsm_fifo_process(0, batch, accel, gyro) == 1);
+		assert(gyro_discontinuities == (i == 3 ? 1u : 0u));
+	}
+}
+
+static void test_adaptive_group(void)
+{
+	static const uint8_t lengths[] = {1, 7, 8, 14, 15, 18};
+	uint8_t sub = 8, out[19];
+	for (unsigned n = 0; n < ARRAY_SIZE(lengths); n++) {
+		unsigned len = lengths[n], slots = (len + 6) / 7;
+		reset_model(true, true);
+		assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, len) == 0);
+		assert(memcmp(out, hw.external + sub, len) == 0);
+		assert(hw.last_master == (0x44 | (slots - 1)));
+		for (unsigned slot = 0, offset = 0; slot < slots; slot++) {
+			unsigned take = len - offset > 7 ? 7 : len - offset;
+			unsigned base = LSM6DSV_SLV0_ADD + slot * 3;
+			assert(hw.hub[base] == 0x3d);
+			assert(hw.hub[base + 1] == sub + offset);
+			assert(hw.hub[base + 2] == ((slot == 0 ? 0xa0 : slot == 1 ? 0x10 : 0) | take));
+			offset += take;
+		}
+		advance(150000);
+		assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, len) == 0);
+		assert(memcmp(out, hw.external + sub, len) == 0);
+		for (unsigned slot = 0; slot < slots; slot++) {
+			reset_model(false, true);
+			hw.error = 8u << slot;
+			memset(out, 0xa5, sizeof(out));
+			assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, len) == -EIO);
+			for (unsigned i = 0; i < sizeof(out); i++)
+				assert(out[i] == 0xa5);
+		}
+	}
+	reset_model(true, true);
+	unsigned transactions = hw.transactions;
+	assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, 19) == -EINVAL);
+	assert(hw.transactions == transactions);
+	assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, 18) == 0);
+	assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, 1) == 0);
+	assert(hw.last_master == 0x44);
+	uint8_t command[] = {0x20, 0x73};
+	assert(hw.ext->ext_write(0x1e, command, sizeof(command)) == 0);
+	assert(hw.last_master == 0x44 && hw.writes == 1);
+}
+
+static void test_group_failure_output(void)
+{
+	uint8_t sub = 8, out[18];
+	reset_model(true, false);
+	hw.transactions = 0;
+	assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, sizeof(out)) == 0);
+	unsigned total = hw.transactions;
+	for (unsigned failure = 1; failure <= total; failure++) {
+		reset_model(true, false);
+		hw.transactions = 0;
+		hw.fail_transaction = failure;
+		hw.partial_read_error = true;
+		memset(out, 0xa5, sizeof(out));
+		assert(hw.ext->ext_write_read(0x1e, &sub, 1, out, sizeof(out)) != 0);
+		for (unsigned i = 0; i < sizeof(out); i++)
+			assert(out[i] == 0xa5);
+		assert(!hw.master && !hw.bank);
+	}
+}
+
 int main(void)
 {
+	test_adaptive_group();
+	test_group_failure_output();
+	test_consecutive_unknown_tags();
+	test_hp_minimum_rate();
 	test_nack(false);
 	test_nack(true);
 	test_configuration_failfast();
@@ -406,9 +691,14 @@ int main(void)
 	test_pending_status_io_failure();
 	test_failed_read_invalidates();
 	test_deadlines_and_status_io();
+	test_frame_layout_and_background_epochs();
+	test_frame_rearms_after_incidental_read();
+	test_stop_settles_only_running_slots();
 	test_prefetch_policy_lifecycle();
 	test_ambiguous_write_is_not_replayed();
 	test_shutdown_after_stop_failure();
+	test_wom_bus_failures();
+	test_fifo_destructive_loss_notification();
 	puts("LSM6DSV full-driver proxy regressions passed");
 	return 0;
 }

@@ -15,7 +15,7 @@ CONFIG_IGNORE_CHARGE_WAKE_ON_VBUS=y
 # otherwise the EN floats and the rail can stay powered.
 CONFIG_VCC_GPIO_IS_ENABLE=y
 
-CONFIG_SENSOR_ROTATION_0=y
+CONFIG_SENSOR_ROTATION_270=y
 
 #generate for adafruit uf2 bootloader flashing
 CONFIG_BUILD_OUTPUT_UF2=y

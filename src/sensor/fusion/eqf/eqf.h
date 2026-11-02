@@ -13,12 +13,14 @@
 #include "sensor/sensor.h"
 
 void eqf_init(float g_time, float a_time, float m_time);
-void eqf_load(const void *data);
+void eqf_load(const void *data, float g_time, float a_time, float m_time);
 void eqf_save(void *data);
 
 void eqf_update_gyro(float *g, float time);
 void eqf_update_accel(float *a, float time);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 void eqf_update_mag(float *m, float time);
+#endif
 void eqf_update(float *g, float *a, float *m, float time);
 
 void eqf_get_gyro_bias(float *g_off);
@@ -26,15 +28,14 @@ void eqf_set_gyro_bias(float *g_off);
 /* New gyro input = old input + delta_dps, in input-IMU axes. */
 void eqf_rebase_gyro_bias(const float delta_dps[3]);
 
-void eqf_update_gyro_sanity(float *g, float *m);
-int eqf_get_gyro_sanity(void);
-
 void eqf_get_lin_a(float *lin_a);
 void eqf_get_quat(float *q);
 
 bool eqf_get_rest_detected(void);
+#if CONFIG_SENSOR_USE_MAGNETOMETER
 bool eqf_get_mag_dist_detected(void);
 void eqf_get_mag_ref(float *norm, float *dip);
+#endif
 
 extern const sensor_fusion_t sensor_fusion_eqf;
 

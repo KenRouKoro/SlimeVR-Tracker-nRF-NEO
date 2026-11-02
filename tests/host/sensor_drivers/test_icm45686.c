@@ -25,6 +25,7 @@ struct bus_record {
 };
 static struct {
 	uint8_t host[256], ireg[65536], external[256];
+	uint8_t external_address; /* Address of the modeled external peripheral. */
 	uint8_t fifo[8][20];
 	unsigned fifo_count, fifo_capacity, fifo_reads, fifo_events, count_reads;
 	bool fifo_corrupt, stale_count;
@@ -116,7 +117,7 @@ static void write_ireg(uint16_t address, uint8_t value)
 	if (address != TOP(ICM45686_I2CM_CONTROL) || !(value & ICM45686_I2CM_CONTROL_GO))
 		return;
 	assert(!hw.busy); /* Reprogramming/GO while an old transaction runs is unsafe. */
-	assert(hw.ireg[TOP(ICM45686_DEV_PROFILE_1)] == 0x1e);
+	assert(hw.ireg[TOP(ICM45686_DEV_PROFILE_1)] == hw.external_address);
 	hw.go_count++;
 	hw.go_at = hw.now;
 	hw.busy = true;
@@ -278,6 +279,7 @@ static void initialize(void)
 static void reset_model(bool prefetch)
 {
 	memset(&hw, 0, sizeof(hw));
+	hw.external_address = 0x1e;
 	hw.now = 100000;
 	hw.latency = 1;
 	hw.duration = 80;
@@ -558,15 +560,19 @@ static void test_elapsed_deadline(void)
 		assert(read_sample(0x08, &out, 1) == -ETIMEDOUT);
 		assert(out == 0xa5 && hw.go_count == 1 && hw.data_reads == 0);
 		uint64_t poll_start = 0;
+		unsigned polls = 0;
 		for (unsigned j = first; j < hw.record_count; j++) {
 			const struct bus_record *r = &hw.records[j];
 			if (r->kind == ADDRESS && r->address == TOP(ICM45686_I2CM_STATUS) && r->at >= hw.go_at) {
-				poll_start = r->at;
-				break;
+				if (!poll_start)
+					poll_start = r->at;
+				polls++;
 			}
 		}
 		assert(poll_start);
 		assert(poll_start <= hw.go_at + 8); /* No nominal AUX pre-delay. */
+		/* BUSY polls yield between reads instead of spinning on the bus. */
+		assert(polls <= 10000 / (50 + 2 * hw.latency) + 4);
 		/* Millisecond uptime may round the start down by 999us. A physical
 		 * STATUS read is two host transfers with two mandatory 4us gaps. */
 		uint64_t elapsed = hw.now - poll_start;
@@ -836,6 +842,67 @@ static void test_icm45686_watermark_progress(void)
 	assert(hw.fifo_events == 0);
 }
 
+static void test_icm45686_temperature_sentinel(void)
+{
+	reset_model(false);
+	uint8_t data[60];
+	put_be16(hw.host + ICM45686_TEMP_DATA1_UI, 1280);
+	append_frame(1);
+	put_be16(hw.fifo[0] + 13, INT16_MIN);
+	assert(icm45_fifo_read(data, sizeof(data)) == 1);
+	assert(icm45_temp_read() == 35.0f);
+	append_frame(1);
+	append_frame(2);
+	append_frame(3);
+	put_be16(hw.fifo[0] + 13, INT16_MIN);
+	assert(icm45_fifo_read(data, sizeof(data)) == 3);
+	assert(icm45_temp_read() == 27.5f);
+}
+
+static void test_icm45686_header_flags(void)
+{
+	for (unsigned header = 0; header < 256; header++) {
+		reset_model(false);
+		append_frame(2);
+		hw.fifo[0][0] = header;
+		put_be16(hw.host + ICM45686_TEMP_DATA1_UI, 1280);
+		uint8_t data[20];
+		assert(icm45_fifo_read(data, sizeof(data)) == 1);
+		float a[3] = {77, 77, 77}, g[3] = {88, 88, 88};
+		if (header >= 0x78 && header <= 0x7b) {
+			assert(icm45_fifo_process(0, data, a, g) == 0);
+			assert(a[0] == 2 && g[0] == 0);
+			assert(icm45_temp_read() == 27);
+		} else {
+			assert(icm45_fifo_process(0, data, a, g) == 1);
+			assert(a[0] == 77 && g[0] == 88);
+			assert(icm45_temp_read() == 35);
+		}
+	}
+}
+
+static void test_icm45686_hires_vectors(void)
+{
+	uint8_t packet[40] = {0};
+	uint8_t *p = packet + 20;
+	p[0] = 0x7b;
+	put_be16(p + 1, -1);
+	put_be16(p + 7, -1);
+	p[17] = 0xff;
+	float a[3], g[3];
+	assert(icm45_fifo_process(1, packet, a, g) == 0);
+	assert(a[0] == -1.0f / 16384 && g[0] == -125.0f / 16384);
+	for (unsigned axis = 0; axis < 3; axis++)
+		put_be16(p + 7 + axis * 2, INT16_MIN);
+	assert(icm45_fifo_process(1, packet, a, g) == 0);
+	assert(a[0] == -1.0f / 16384 && g[0] == 0 && g[1] == 0 && g[2] == 0);
+	for (unsigned axis = 0; axis < 3; axis++)
+		put_be16(p + 1 + axis * 2, INT16_MIN);
+	a[0] = 77; g[0] = 88;
+	assert(icm45_fifo_process(1, packet, a, g) == 1);
+	assert(a[0] == 77 && g[0] == 88);
+}
+
 int main(void)
 {
 	test_icm45686_direct_units();
@@ -844,6 +911,9 @@ int main(void)
 	test_icm45686_fifo_full_progress();
 	test_icm45686_fifo_failures();
 	test_icm45686_watermark_progress();
+	test_icm45686_temperature_sentinel();
+	test_icm45686_header_flags();
+	test_icm45686_hires_vectors();
 	test_prefetch_snapshot();
 	test_disabled_prefetch_lifecycle();
 	test_error_completions();
